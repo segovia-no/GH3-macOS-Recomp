@@ -113,8 +113,10 @@ Ghidra 12.2 headless (about 10 min on this Mac): 20,049 functions (1,012 multi-c
 - [x] Bink 1.9 frame-buffer API; intro movies play.
 - [x] FMOD Ex lifted (CPU probes replaced), Winsock TCP, overlapped I/O, D3DX volume/PNG/JPEG/conversions.
 - [x] **Title screen, BetterGH3 online dialog and controller-help screen render** (Metal), 3-minute runs without a fatal.
-- [ ] Performance: Havok solver at -O0 is ~80% of the main thread (20-40 fps).
-- [ ] Input mapping (keyboard frets / guitar), audio verification, gameplay.
+- [x] Performance: ~120 fps (vsync-capped) after `--no-x87-doubles` + all -O2 (was 20-40).
+- [x] Audio: FMOD → DirectSound → SwARc mixer → CoreAudio; verified by dump.
+- [x] Keyboard input: GH3's default map decoded; menus navigable (user-tested).
+- [ ] Gameplay (song) not yet reached in automation; guitar controllers untested.
 
 ## First arm64 build and boot (observed)
 
@@ -225,3 +227,26 @@ Each line is the fatal stop after the previous fix. `tools/boot.sh`.
   1. **Native replacements of the solver functions** (`replace 0080c0a0` / `007fd500`): SwARc's intended workflow; the lifted body stays as reference. Havok 4.x solver code; write from the decompilation (`work/giant_decomp.c`), verify against the lifted body.
   2. Make clang finish at -O1/-O2 on them: the x87 runs emit a fast host-double path plus an exact fallback for every instruction, so the CFG is huge. Try `-ftime-trace` to find the pass, or a lifter option to split giant functions.
   3. Upload L8/other formats without per-pixel CPU conversion where SDL_GPU has a native format.
+
+## Performance fix (observed)
+
+- Profile showed ~80% of the main thread in Havok's solver (0x80C0A0, 0x7FD500), built at -O0 because clang could not finish them at -O1/-O2.
+- Cause: every x87 run is emitted three times: a host-double path (taken only at PC=53), the exact register-run path (with the PC=24 `Fast24` fast path), and a per-instruction fallback. The double path's per-instruction exits into a resume switch make the CFG huge. GH3's render thread runs at PC=24 (D3D9 without FPU_PRESERVE), so that path is never taken.
+- Fix: lifter option **`--no-x87-doubles`**, per module (after its `--exe`/`--module`), on for GH3.exe only. FMOD and the CRT keep the double path (FMOD's mixer thread stays at PC=53).
+- The solver function alone (12.5k instructions):
+
+| | -O0 | -O1 | -O2 |
+|---|---|---|---|
+| with double path | 268 s, 178 MB .o | >25 min | – |
+| `--no-x87-doubles` | 258 s, 166 MB | 754 s | **470 s, 4.5 MB** |
+
+- Whole build at -O2: 14 min on 11 cores; binary **590 MB → 114 MB**.
+- fps (menus/movies, 1024x768, vsync): median **119.9** (display 120 Hz), p10 80, min 3.4 (load hitches). Before: 20-40.
+
+## Audio fix (observed)
+
+- FMOD Ex loads `dsound.dll` dynamically. SwARc lacked it in its known-module list and registered `DirectSoundCreate8` by ordinal only.
+- Then FMOD enumerated devices and created none: its `DirectSoundEnumerateA` callback (fmodex 0x1002F030) skips the NULL-GUID "Primary Sound Driver" entry. Windows also reports each real device with a GUID; SwARc now reports the primary entry plus one device ("Speakers").
+- Now: `DirectSoundCreate8` → `audio: 48000 Hz stereo on SDL driver 'coreaudio'`.
+- Dev aid: `GH3_AUDIO_DUMP=file.wav` (mixer tap, float32 stereo 48 kHz). A 37 s boot dump has the logo-movie sounds (2-10 s) and sustained menu music (25 s on); nothing is silent where sound is expected. By-ear check pending.
+- `GH3_TRACE=1` (+ `GH3_TRACE_FILTER=dsound`) logs import calls (wired in `recomp/src/main.cpp`).

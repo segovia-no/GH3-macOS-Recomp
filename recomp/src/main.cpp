@@ -2,8 +2,10 @@
 //   gh3 <game dir> [exe]   (exe defaults to <game dir>/GH3.exe)
 
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
+#include "runtime/log.h"
 #include "win32/process.h"
 
 int main(int argc, char** argv) {
@@ -12,6 +14,8 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string game_dir = argv[1];
+  // GH3_TRACE=1: log every import call (GH3_TRACE_FILTER narrows it).
+  recomp::g_trace = std::getenv("GH3_TRACE") != nullptr;
   const std::string exe = argc > 2 ? argv[2] : game_dir + "/GH3.exe";
 
   recomp::win32::GameConfig game;

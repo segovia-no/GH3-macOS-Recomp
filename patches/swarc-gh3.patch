@@ -1061,6 +1061,128 @@ index 62cb420..c57faef 100644
  // ---- maths -----------------------------------------------------------------------------
  // In single precision, operations in the order D3DX evaluates them (built
  // without FMA contraction, see CMakeLists.txt): the game's own maths uses
+diff --git a/platforms/win32/src/win32/dsound.cpp b/platforms/win32/src/win32/dsound.cpp
+index 7c8dc7c..adbf986 100644
+--- a/platforms/win32/src/win32/dsound.cpp
++++ b/platforms/win32/src/win32/dsound.cpp
+@@ -18,6 +18,7 @@
+ // implemented: fatal and named.
+ 
+ #include <cmath>
++#include <cstdio>
+ #include <cstring>
+ #include <memory>
+ #include <mutex>
+@@ -337,15 +338,93 @@ void WriteFormat(uint32_t va, uint32_t size, const Format& f) {
+ 
+ // ---- DirectSoundCreate8 and IDirectSound8
+ 
+-// (lpcGuidDevice, ppDS8, pUnkOuter)
+-HLE_NAMED("dsound.dll", "#11", DirectSoundCreate8, 3) {
++// Dev aid: <ID>_AUDIO_DUMP=file.wav records what the mixer plays (32-bit
++// float stereo at 48 kHz). The header's sizes are patched as data comes.
++FILE* g_dump = nullptr;
++uint32_t g_dump_frames = 0;
++void DumpTap(const float* stereo, int frames) {
++  if (!g_dump) return;
++  std::fwrite(stereo, sizeof(float) * 2, size_t(frames), g_dump);
++  g_dump_frames += uint32_t(frames);
++  uint32_t data = g_dump_frames * 8, riff = 36 + data;
++  long at = std::ftell(g_dump);
++  std::fseek(g_dump, 4, SEEK_SET);
++  std::fwrite(&riff, 4, 1, g_dump);
++  std::fseek(g_dump, 40, SEEK_SET);
++  std::fwrite(&data, 4, 1, g_dump);
++  std::fseek(g_dump, at, SEEK_SET);
++}
++void StartDump() {
++  const char* path = Env("AUDIO_DUMP");
++  if (!path || g_dump) return;
++  g_dump = std::fopen(path, "wb");
++  if (!g_dump) return;
++  // RIFF/WAVE, fmt: IEEE float (3), 2 channels, 48000 Hz, 32 bits.
++  const uint32_t rate = 48000, byte_rate = rate * 8, zero = 0, fmt_size = 16;
++  const uint16_t format = 3, channels = 2, align = 8, bits = 32;
++  std::fwrite("RIFF", 1, 4, g_dump);
++  std::fwrite(&zero, 4, 1, g_dump);
++  std::fwrite("WAVEfmt ", 1, 8, g_dump);
++  std::fwrite(&fmt_size, 4, 1, g_dump);
++  std::fwrite(&format, 2, 1, g_dump);
++  std::fwrite(&channels, 2, 1, g_dump);
++  std::fwrite(&rate, 4, 1, g_dump);
++  std::fwrite(&byte_rate, 4, 1, g_dump);
++  std::fwrite(&align, 2, 1, g_dump);
++  std::fwrite(&bits, 2, 1, g_dump);
++  std::fwrite("data", 1, 4, g_dump);
++  std::fwrite(&zero, 4, 1, g_dump);
++  M().SetTap(DumpTap);
++}
++
++// (lpcGuidDevice, ppDS8, pUnkOuter). Imported by ordinal or found by name
++// (GetProcAddress after LoadLibrary("dsound.dll")). DirectSoundCreate
++// returns the same object: IDirectSound8 extends IDirectSound.
++uint32_t CreateDirectSound(Ctx& c) {
+   if (!Arg(c, 1)) return DSERR_INVALIDPARAM;
+   Wr32(Arg(c, 1), 0);
+   if (Arg(c, 2)) return DSERR_NOAGGREGATION;
++  StartDump();
+   if (!M().Open(48000)) return DSERR_NODRIVER;
+   Wr32(Arg(c, 1), com::Publish(std::make_shared<DirectSound>(), DirectSoundVtable()));
+   return DS_OK;
+ }
++HLE_NAMED("dsound.dll", "#11", DirectSoundCreate8, 3) { return CreateDirectSound(c); }
++HLE_NAMED("dsound.dll", "DirectSoundCreate8", DirectSoundCreate8ByName, 3) {
++  return CreateDirectSound(c);
++}
++HLE_NAMED("dsound.dll", "#1", DirectSoundCreate, 3) { return CreateDirectSound(c); }
++HLE_NAMED("dsound.dll", "DirectSoundCreate", DirectSoundCreateByName, 3) {
++  return CreateDirectSound(c);
++}
++
++// DirectSoundEnumerateA(lpDSEnumCallback, lpContext): as Windows does, the
++// primary driver (lpGuid NULL) first, then each device with its GUID; here
++// one device, the host's default output. Some callers skip the NULL entry.
++// BOOL CALLBACK cb(LPGUID, LPCSTR description, LPCSTR module, LPVOID ctx);
++// enumeration stops when it returns FALSE.
++uint32_t EnumerateA(Ctx& c) {
++  static const gaddr block = [] {
++    gaddr b = HeapAllocProcess(256, true);
++    PutStr(b, "Primary Sound Driver");
++    PutStr(b + 64, "Speakers");
++    PutStr(b + 128, "{0.0.0.00000000}.{5C1A1E6B-3D7E-4F2A-9B11-6A2F0C4E7D21}");
++    // The device's GUID (any fixed value: DirectSoundCreate opens the
++    // default output whichever GUID it is given).
++    const uint8_t guid[16] = {0x6B, 0x1E, 0x1A, 0x5C, 0x7E, 0x3D, 0x2A, 0x4F,
++                              0x9B, 0x11, 0x6A, 0x2F, 0x0C, 0x4E, 0x7D, 0x21};
++    std::memcpy(GPtr(b + 224), guid, 16);
++    return b;
++  }();
++  if (!Arg(c, 0)) return DSERR_INVALIDPARAM;
++  if (uint32_t(CallGuest(c, Arg(c, 0), {0, block, block + 192, Arg(c, 1)})))
++    CallGuest(c, Arg(c, 0), {block + 224, block + 64, block + 128, Arg(c, 1)});
++  return DS_OK;
++}
++HLE_NAMED("dsound.dll", "#2", DirectSoundEnumerateA, 2) { return EnumerateA(c); }
++HLE_NAMED("dsound.dll", "DirectSoundEnumerateA", DirectSoundEnumerateAByName, 2) {
++  return EnumerateA(c);
++}
+ 
+ HLE_NAMED("dsound.dll", "IDirectSound8::QueryInterface", DS8_QueryInterface, 3) {
+   uint32_t riid = Arg(c, 1), out = Arg(c, 2);
+diff --git a/platforms/win32/src/win32/hle.cpp b/platforms/win32/src/win32/hle.cpp
+index b2449dd..344bee5 100644
+--- a/platforms/win32/src/win32/hle.cpp
++++ b/platforms/win32/src/win32/hle.cpp
+@@ -30,7 +30,8 @@ const std::vector<std::string>& KnownDlls() {
+       "kernel32.dll", "user32.dll",  "gdi32.dll",    "advapi32.dll",
+       "ole32.dll",    "version.dll", "winmm.dll",    "wsock32.dll",
+       "ddraw.dll",    "mss32.dll",   "binkw32.dll",  "dbghelp.dll",
+-      "imm32.dll",    "shfolder.dll", "ntdll.dll",   "opengl32.dll"};
++      "imm32.dll",    "shfolder.dll", "ntdll.dll",   "opengl32.dll",
++      "dsound.dll"};
+   return dlls;
+ }
+ 
 diff --git a/platforms/win32/src/win32/kernel32.cpp b/platforms/win32/src/win32/kernel32.cpp
 index 2a04eb3..91dc443 100644
 --- a/platforms/win32/src/win32/kernel32.cpp
@@ -1750,6 +1872,41 @@ index 745e070..f88dd4e 100644
  // XInputSetState(dwUserIndex, pVibration): XINPUT_VIBRATION
  // {wLeftMotorSpeed, wRightMotorSpeed}; held until changed.
  HLE_NAMED("xinput1_3.dll", "#3", XInputSetState, 2) {
+diff --git a/src/runtime/audio/mixer.cpp b/src/runtime/audio/mixer.cpp
+index 2331e6a..840cf16 100644
+--- a/src/runtime/audio/mixer.cpp
++++ b/src/runtime/audio/mixer.cpp
+@@ -146,6 +146,7 @@ void SDLCALL AudioCallback(void* ud, SDL_AudioStream* s, int additional, int) {
+   while (frames > 0) {
+     int n = std::min(frames, kChunk);
+     m->Mix(buf, n);
++    if (auto tap = m->tap()) tap(buf, n);
+     SDL_PutAudioStreamData(s, buf, n * int(2 * sizeof(float)));
+     frames -= n;
+   }
+diff --git a/src/runtime/audio/mixer.h b/src/runtime/audio/mixer.h
+index dda6c69..4f6dbab 100644
+--- a/src/runtime/audio/mixer.h
++++ b/src/runtime/audio/mixer.h
+@@ -133,6 +133,10 @@ class Mixer {
+ 
+   // Called by the audio thread.
+   void Mix(float* out, int frames);
++  // Dev aid: called with every chunk the device plays (interleaved stereo
++  // floats), on the audio thread. Set before Open.
++  void SetTap(void (*tap)(const float* stereo, int frames)) { tap_ = tap; }
++  void (*tap() const)(const float*, int) { return tap_; }
+ 
+  private:
+   void Init(int rate);
+@@ -147,6 +151,7 @@ class Mixer {
+ 
+   std::mutex mu_;
+   SDL_AudioStream* stream_ = nullptr;
++  void (*tap_)(const float*, int) = nullptr;
+   int rate_ = 0;
+   float master_ = 1.0f;
+   // LowPass coefficients (a1, a2) per 10 mB of HF cut, 0 to -10000.
 diff --git a/src/runtime/gfx/format.cpp b/src/runtime/gfx/format.cpp
 index 28cc240..1937f28 100644
 --- a/src/runtime/gfx/format.cpp
@@ -2031,7 +2188,7 @@ index 0000000..233be12
 +  return 0;
 +}
 diff --git a/tools/lifter_x86/emit.cpp b/tools/lifter_x86/emit.cpp
-index f73425f..37b583d 100644
+index f73425f..4bce368 100644
 --- a/tools/lifter_x86/emit.cpp
 +++ b/tools/lifter_x86/emit.cpp
 @@ -1696,6 +1696,18 @@ void InsnEmitter::EmitSse() {
@@ -2053,6 +2210,16 @@ index f73425f..37b583d 100644
      case ZYDIS_MNEMONIC_RSQRTPS: {
        if (!IsXmm(0)) return Unimpl();
        std::string s = src(1);
+@@ -3118,7 +3130,8 @@ void Emitter::EmitX87Run(const Function& f, std::map<uint64_t, Insn>::const_iter
+   std::string dbody;
+   std::vector<uint64_t> resume;
+   bool doubles = false;
+-  for (auto j = first; j != end; ++j)
++  const Module* mod = p_.TextOf(first->first);
++  for (auto j = first; mod && mod->x87_doubles && j != end; ++j)
+     if (IsX87(j->second.d) && (X87OpName(j->second.d.mnemonic) ||
+                                j->second.d.mnemonic == ZYDIS_MNEMONIC_FSQRT))
+       doubles = true;
 diff --git a/tools/lifter_x86/function.cpp b/tools/lifter_x86/function.cpp
 index 11c251d..c17b1c5 100644
 --- a/tools/lifter_x86/function.cpp
@@ -2107,7 +2274,7 @@ index 11c251d..c17b1c5 100644
        // A byte index table picks the entry.
        if (!in_text(index, cases)) return false;
 diff --git a/tools/lifter_x86/main.cpp b/tools/lifter_x86/main.cpp
-index cc4778c..a4a04d8 100644
+index cc4778c..88ba325 100644
 --- a/tools/lifter_x86/main.cpp
 +++ b/tools/lifter_x86/main.cpp
 @@ -31,6 +31,7 @@
@@ -2118,7 +2285,40 @@ index cc4778c..a4a04d8 100644
  #include <cctype>
  #include <cstdio>
  #include <deque>
-@@ -205,7 +206,7 @@ int main(int argc, char** argv) {
+@@ -92,6 +93,7 @@ const char* kFilePrologue =
+ struct ModuleArgs {
+   std::string path, symdir, manifest;
+   uint64_t base = 0;
++  bool no_x87_doubles = false;
+ };
+ 
+ int main(int argc, char** argv) {
+@@ -110,6 +112,7 @@ int main(int argc, char** argv) {
+     else if (a == "--manifest") mods.back().manifest = val();
+     else if (a == "--base") mods.back().base = std::stoull(val(), nullptr, 16);
+     else if (a == "--out") outdir = val();
++    else if (a == "--no-x87-doubles") mods.back().no_x87_doubles = true;
+     else if (a == "--insns-per-file") per_file = std::stoull(val());
+     else if (a == "--dump") dump = std::stoull(val(), nullptr, 16);
+     else if (a == "--x87-test") x87_test = val();
+@@ -131,7 +134,7 @@ int main(int argc, char** argv) {
+   }
+   if (mods[0].path.empty()) {
+     std::fprintf(stderr, "usage: recomp_lift --exe game.exe "
+-                         "[--symbols dir] [--out dir] "
++                         "[--symbols dir] [--out dir] [--no-x87-doubles] "
+                          "[--module game.dll --symbols dir]...\n");
+     return 2;
+   }
+@@ -147,6 +150,7 @@ int main(int argc, char** argv) {
+       std::fprintf(stderr, "manifest: %s\n", err.c_str());
+       return 1;
+     }
++    p.modules.back().x87_doubles = !m.no_x87_doubles;
+   }
+   lifter::Decoder dec(p.x64);
+   // Files lifted from x64 images see lifted.h's x64 register model.
+@@ -205,7 +209,7 @@ int main(int argc, char** argv) {
    std::set<uint64_t> done;
    size_t from_code_ptrs = 0, from_data_ptrs = 0;
    auto candidate = [&](const lifter::Module* m, uint64_t t, size_t* counter) {
@@ -2127,7 +2327,7 @@ index cc4778c..a4a04d8 100644
      lifter::Insn in;
      if (!dec.Decode(p, t, &in)) return;
      p.entries.insert(t);
-@@ -223,7 +224,7 @@ int main(int argc, char** argv) {
+@@ -223,7 +227,7 @@ int main(int argc, char** argv) {
          for (uint64_t a = lo; a + 4 <= hi; a += 4)
            candidate(&m, p.mem.read<uint32_t>(a), &from_data_ptrs);
      }
@@ -2136,7 +2336,7 @@ index cc4778c..a4a04d8 100644
    while (!work.empty()) {
      uint64_t e = work.front();
      work.pop_front();
-@@ -236,9 +237,23 @@ int main(int argc, char** argv) {
+@@ -236,9 +240,23 @@ int main(int argc, char** argv) {
        more = false;
        for (const auto& [va, in] : f.insns) {
          std::vector<uint64_t> targets;
@@ -2162,7 +2362,7 @@ index cc4778c..a4a04d8 100644
          p.jumptables[va] = std::move(targets);
          recovered_tables++;
          more = true;
-@@ -274,8 +289,8 @@ int main(int argc, char** argv) {
+@@ -274,8 +292,8 @@ int main(int argc, char** argv) {
                "%zu via code pointers, %zu via data pointers; %zu weak)\n",
                p.entries.size(), initial, p.entries.size() - initial,
                from_code_ptrs, from_data_ptrs, p.weak.size());
@@ -2196,13 +2396,18 @@ index 0bd1b03..5e08f43 100644
        entries.insert(va);
        replaced.insert(va);
 diff --git a/tools/lifter_x86/program.h b/tools/lifter_x86/program.h
-index 5bfaca4..cc9d581 100644
+index 5bfaca4..418168b 100644
 --- a/tools/lifter_x86/program.h
 +++ b/tools/lifter_x86/program.h
-@@ -21,6 +21,22 @@ struct Module {
+@@ -21,6 +21,27 @@ struct Module {
    // Where it is mapped, and the base its symbol files and manifest use.
    uint64_t base = 0, preferred_base = 0;
    uint64_t text_lo = 0, text_hi = 0;  // [lo, hi) of .text
++  // --no-x87-doubles (after this module's --exe/--module): its x87 runs get
++  // no host-double path. Code that runs at PC=24 (a thread that created a
++  // Direct3D device without FPU_PRESERVE) never takes that path (it needs
++  // PC=53), so there it only costs code size and compile time.
++  bool x87_doubles = true;
 +  // Executable sections besides .text, as [lo, hi) ranges: code that a
 +  // protector's unwrapper moved out of .text into a section of its own.
 +  std::vector<std::pair<uint64_t, uint64_t>> extra_text;
@@ -2222,7 +2427,15 @@ index 5bfaca4..cc9d581 100644
    // Initialised data scanned for code pointers, as [lo, hi) ranges.
    std::vector<std::pair<uint64_t, uint64_t>> data;
    // Read-only data outside .text that may hold switch tables (an ELF's
-@@ -67,6 +83,10 @@ struct Program {
+@@ -59,6 +80,7 @@ struct Program {
+   std::vector<Module> modules;  // [0] is the EXE
+   bool x64 = false;  // x64 images (all modules are one or the other)
+ 
++
+   std::set<uint64_t> entries;                 // function entry points
+   // Entries known only from pointer scans (a dword in data or an
+   // immediate that happens to point into .text). They get their own
+@@ -67,6 +89,10 @@ struct Program {
    // at all, and splitting a loop at one turned every iteration into a
    // nested host call (a "freeze" that was really deepening recursion).
    std::set<uint64_t> weak;
@@ -2233,7 +2446,7 @@ index 5bfaca4..cc9d581 100644
  
    // True if control reaching t from another function leaves that function
    // (a tail call) rather than continuing inline.
-@@ -104,15 +124,16 @@ struct Program {
+@@ -104,15 +130,16 @@ struct Program {
    // resume/replace/setjmp lines, VAs at its preferred base).
    bool LoadManifest(const std::string& path, std::string* err);
  
