@@ -107,7 +107,10 @@ Ghidra 12.2 headless (about 10 min on this Mac): 20,049 functions (1,012 multi-c
 - [x] Name pipeline (CFuncs + GH3+) into the manifest.
 - [x] Compile lifted output on arm64.
 - [x] First boot: runs CRT startup natively; stops at the first missing import.
-- [ ] CRT: lift msvcr80/msvcp80 8.0.50727.762 as modules (see below).
+- [x] CRT: msvcr80/msvcp80 lifted as statically imported modules.
+- [x] AWL reimplemented natively (`recomp/src/awl.cpp`).
+- [x] GH3+ loader stub replaced (`recomp/src/plugins.cpp`).
+- [ ] Bink 1.9 frame-buffer API (next blocker).
 
 ## First arm64 build and boot (observed)
 
@@ -150,3 +153,37 @@ Ghidra 12.2 headless (about 10 min on this Mac): 20,049 functions (1,012 multi-c
 
 - What remains large is real code: `0x80C0A0`, `0x8066A0`, `0x8126E0` (84–95k lines each), `0x7FD500`, `0x7A6C30`, `0x797050`. `recomp/CMakeLists.txt` compiles lifted files over 5 MB at -O1.
 - Caveat: when a dropped entry was a real target that Ghidra missed, the runtime stops with "indirect branch to unlifted address X". The fix is an `entry X` line in `recomp/overrides.manifest`.
+
+## Boot progress log (observed)
+
+Each line is the fatal stop after the previous fix. `tools/boot.sh`.
+
+| # | Stops at | Fix |
+|---|---|---|
+| 1 | `kernel32!InterlockedCompareExchange` | SwARc kernel32: InterlockedCompareExchange, InterlockedExchangeAdd |
+| 2 | `msvcr80!_initterm_e` | Lift the real CRT (below) |
+| 3 | `advapi32!CryptAcquireContextA` (static init, 0x896276) | SwARc advapi32: CryptAcquireContextA/ReleaseContext/GenRandom (host CSPRNG) |
+| 4 | `awl.dll!Aspyr::Win::Init` (WinMain 0x40157c) | `recomp/src/awl.cpp`: all 20 AWL imports natively |
+| 5 | branch 0x4016de → 0x897d40 outside lifted code | SwARc PE loader maps raw data up to the aligned virtual size, as Windows does (the stub is in `.text`'s last page past VirtualSize); stub `replace`d by `recomp/src/plugins.cpp` |
+| 6 | `user32!SetWindowTextW` (window setup 0x57ba91) | SwARc user32: SetWindowTextW |
+| 7 | `binkw32!_BinkSetMemory@8` (0x5e0a29) | **open**: Bink 1.9 frame-buffer API |
+
+### Lifting the CRT (observed)
+
+- Source: Microsoft's VC++ 2005 SP1 redistributable with the MFC security update (`download.microsoft.com/download/8/B/4/8B42259F-5D70-43F4-AC2E-4B208FD8D66A/vcredist_x86.EXE`, Microsoft-signed, sha256 `8648c5fc…adfd`). `7zz x` → `vcredist.msi` → `_14241_Microsoft_VC80_CRT_x86.msm` → `msvcr80.dll` (sha256 `c3ac989c…1c6d`) and `msvcp80.dll` (`372af797…ffb2`), **8.0.50727.6195**. That's the security-patched build of the 8.0.50727.762 GH3's manifest names; Windows' publisher policy redirects .762 to it.
+- Staged in `work/crt/` and `work/gamedir/` (gitignored; build inputs, not redistributed).
+- Ghidra: 2,019 functions (msvcr80), 2,841 (msvcp80). Neither has static TLS. msvcr80 imports 160 kernel32 functions (120 HLE'd; the rest are console/process/wide-path APIs, fatal only if called), msvcp80 imports msvcr80 + 23 kernel32.
+- Lift: `recomp_lift --exe GH3.exe ... --module crt/msvcr80.dll --symbols symbols_msvcr80 --module crt/msvcp80.dll --symbols symbols_msvcp80`: 37,551 functions, 1.56M instructions, 131 files.
+- **SwARc change: statically imported lifted DLLs.** SwARc only supported DLLs a game loads itself. New `GameConfig::LiftedDll::static_import`: such DLLs are mapped before the EXE in list order, their exports are bound into importers' IATs (`BindImportSlot` in `process.cpp`; HLE thunk otherwise), and their DllMain(PROCESS_ATTACH) runs before the EXE entry.
+
+### AWL (observed)
+
+- Decompiled the 20 used exports (`work/awl_decomp.c`). They're thin wrappers around cached strings and an XML key/value config.
+- GH3 needs `Init` to return **12**. Language is a two-letter code (GH3 compares the first 2 chars, e.g. "fr"); `LANGUAGE`/`GH3_LANGUAGE` env overrides, default "en".
+- Config keys GH3 reads: Debugging.FullScreen, IntelGpu, Options.{Crowd,Flares,FrontRowCamera,GraphicsQuality,Physics}, Sound.{DspBufferLength,DspNumBuffers,SongSkew,SongSyncInterval,StreamBufferSize,StreamDecodeBufferSize}, Video.{Width,Height,MultiSampleQuality,MultiSampleType}; strings AutoLogin, Username, MatchUsername. Stored in `~/Library/Application Support/gh3/AspyrConfig.ini`.
+- `GetConfigNumber` returns a double in ST0: `x87::LoadF64(c.fpu, ...)`.
+
+### Bink (next)
+
+- GH3 imports Bink 1.9's frame-buffer API (`BinkGetFrameBuffersInfo`, `BinkRegisterFrameBuffers`) and **no** `BinkCopyToBuffer`: it decodes into its own Y/cR/cB/A planes and converts YUV on the GPU. SwARc's binkw32 (ffmpeg) implements only the 1.x copy-to-buffer path. The plan is to extend it: ffmpeg's Bink decoder already outputs planar YUV (+alpha), which maps directly onto the frame-buffer planes. The `BINKFRAMEBUFFERS` layout must be confirmed against GH3's reads of it before relying on it.
+- Lifting the real `binkw32.dll` instead is unlikely to work: its decoder is MMX-heavy, and the lifter lacks MMX (see the unimplemented `punpckhdq`/`psllq` sites).

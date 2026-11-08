@@ -6,7 +6,7 @@
 # merges it with the extracted names into recomp/lifter.manifest.
 
 name 0068f03c entry_point
-name 00897d40 gh3plus_load_core_dll
+replace 00897d40 gh3plus_load_core_dll
 
 # Constants the pointer scan took for code (outside Ghidra's blocks, so
 # tools/find_false_entries.py cannot see them).

@@ -25,6 +25,39 @@ index 5e5d480..e6dfe6b 100644
  
    // x64: every .pdata entry that is not a chained fragment starts a
    // function (ARCHITECTURE.md, "64-bit guests"); those with a language
+diff --git a/platforms/win32/src/win32/advapi32.cpp b/platforms/win32/src/win32/advapi32.cpp
+index 2b4ea5b..69e9522 100644
+--- a/platforms/win32/src/win32/advapi32.cpp
++++ b/platforms/win32/src/win32/advapi32.cpp
+@@ -214,6 +214,28 @@ HLE("advapi32.dll", GetUserNameA, 2) {
+   return 1;
+ }
+ 
++// ---- CryptoAPI: random numbers only -------------------------------------------
++// Games acquire a provider just to call CryptGenRandom (seeds, session ids).
++// The context handle is a non-zero token; CryptGenRandom reads the host's
++// CSPRNG.
++
++constexpr uint32_t kCryptProvToken = 0xC0DE0001;
++
++// (phProv, szContainer, szProvider, dwProvType, dwFlags)
++HLE("advapi32.dll", CryptAcquireContextA, 5) {
++  if (Arg(c, 0)) Wr32(Arg(c, 0), kCryptProvToken);
++  return 1;
++}
++
++HLE("advapi32.dll", CryptReleaseContext, 2) { return 1; }
++
++// (hProv, dwLen, pbBuffer)
++HLE("advapi32.dll", CryptGenRandom, 3) {
++  uint32_t len = Arg(c, 1);
++  if (len) arc4random_buf(GPtr(Arg(c, 2)), len);
++  return 1;
++}
++
+ // ---- ole32 ------------------------------------------------------------------
+ 
+ HLE("ole32.dll", CoInitialize, 1) { return 0; }  // S_OK
 diff --git a/platforms/win32/src/win32/kernel32.cpp b/platforms/win32/src/win32/kernel32.cpp
 index 2a04eb3..91dc443 100644
 --- a/platforms/win32/src/win32/kernel32.cpp
@@ -52,8 +85,42 @@ index 2a04eb3..91dc443 100644
  
  // ---- time ----------------------------------------------------------------
  
+diff --git a/platforms/win32/src/win32/pe_image.cpp b/platforms/win32/src/win32/pe_image.cpp
+index 1f2d0dc..75e859f 100644
+--- a/platforms/win32/src/win32/pe_image.cpp
++++ b/platforms/win32/src/win32/pe_image.cpp
+@@ -67,6 +67,8 @@ bool PeImage::Load(const std::string& path, GuestMemory& mem,
+   preferred_base = x64 ? Rd<uint64_t>(d, oh + 24) : Rd<uint32_t>(d, oh + 28);
+   image_base = base ? base : preferred_base;
+   image_size = Rd<uint32_t>(d, oh + 56);
++  uint32_t section_align = Rd<uint32_t>(d, oh + 32);
++  if (!section_align || (section_align & (section_align - 1))) section_align = 0x1000;
+   uint32_t headers_size = Rd<uint32_t>(d, oh + 60);
+   stack_reserve = x64 ? Rd<uint64_t>(d, oh + 72) : Rd<uint32_t>(d, oh + 72);
+   if (entry) entry += image_base;  // DLLs may have no entry point
+@@ -112,13 +114,18 @@ bool PeImage::Load(const std::string& path, GuestMemory& mem,
+     uint32_t rsize = Rd<uint32_t>(d, o + 16);
+     uint32_t rptr = Rd<uint32_t>(d, o + 20);
+     uint32_t ch = Rd<uint32_t>(d, o + 36);
+-    uint32_t n = std::min(vsize ? vsize : rsize, rsize);
++    // Windows maps a section's raw data up to its virtual size rounded up
++    // to the section alignment, so bytes past VirtualSize in its last page
++    // are loaded too (patched executables put code there). The section
++    // then extends over them.
++    uint32_t span = vsize ? (vsize + section_align - 1) & ~(section_align - 1) : rsize;
++    uint32_t n = std::min(span, rsize);
+     if (rptr + n > d.size()) {
+       *err = std::string("section ") + name + " runs past end of file";
+       return false;
+     }
+     std::memcpy(mem.ptr(image_base + va), d.data() + rptr, n);
+-    sections.push_back({name, image_base + va, vsize, ch});
++    sections.push_back({name, image_base + va, std::max(vsize, n), ch});
+   }
+ 
+   // Base relocations: add the load delta to every HIGHLOW (and, in x64
 diff --git a/platforms/win32/src/win32/process.cpp b/platforms/win32/src/win32/process.cpp
-index eb0bd8d..446ddf0 100644
+index eb0bd8d..b5c4850 100644
 --- a/platforms/win32/src/win32/process.cpp
 +++ b/platforms/win32/src/win32/process.cpp
 @@ -36,6 +36,16 @@ std::pair<gaddr, uint64_t> TextOf(const PeImage& img) {
@@ -73,7 +140,61 @@ index eb0bd8d..446ddf0 100644
  // Process::thread_init: the thread's TEB and TLS array, in the layout of
  // the process's mode, found through fs (32-bit) or gs (x64).
  void InitTeb(Thread* t) {
-@@ -195,6 +205,9 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
+@@ -108,11 +118,28 @@ const PeImage* ImageAt(gaddr va) {
+   return nullptr;
+ }
+ 
++// An IAT slot's value: the export of a statically imported lifted DLL
++// mapped before the importer, else the HLE thunk.
++gaddr BindImportSlot(const std::string& dll, const std::string& name) {
++  const std::string n = hle::NormaliseDll(dll);
++  for (const Module& m : g_win32->modules) {
++    if (m.name != n || !m.static_import || !m.img.image_size) continue;
++    const bool by_ordinal = !name.empty() && name[0] == '#';
++    const uint32_t ordinal = by_ordinal ? uint32_t(std::stoul(name.substr(1))) : 0;
++    for (const PeExport& e : m.img.exports)
++      if (by_ordinal ? e.ordinal == ordinal : e.name == name) return e.va;
++    FatalF("import %s!%s: the lifted DLL has no such export (forwarded exports "
++           "are not supported)",
++           n.c_str(), name.c_str());
++  }
++  return hle::ImportThunk(dll, name);
++}
++
+ void MapModule(Module& m) {
+   Process& p = *g_proc;
+   if (m.img.image_size) p.mem.Decommit(m.img.image_base, m.img.image_size);
+   std::string err;
+-  if (!m.img.Load(m.host_path, p.mem, &err, m.base, hle::ImportThunk))
++  if (!m.img.Load(m.host_path, p.mem, &err, m.base, BindImportSlot))
+     FatalF("lifted DLL %s: %s", m.name.c_str(), err.c_str());
+   // Windows XP did not set up static TLS for LoadLibrary'd DLLs either,
+   // so 32-bit DLLs of that era have none. x64 ones get a slot of their own
+@@ -145,16 +172,20 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
+   };
+   p.pump_events = PumpHostEvents;
+   w.game_args = game_args;
+-  std::string err;
+-  if (!w.img.Load(exe_path, p.mem, &err, 0, hle::ImportThunk))
+-    FatalF("%s", err.c_str());
++  // Lifted DLLs first, so the EXE's imports of statically imported ones
++  // bind to their exports (BindImportSlot).
++  w.modules.reserve(game.lifted_dlls.size());
+   for (const auto& d : game.lifted_dlls) {
+     Module& m = w.modules.emplace_back();
+     m.name = hle::NormaliseDll(d.name);
+     m.host_path = HostPath(GuestGameDir() + "\\" + d.name);
+     m.base = d.base;
++    m.static_import = d.static_import;
+     MapModule(m);
+   }
++  std::string err;
++  if (!w.img.Load(exe_path, p.mem, &err, 0, BindImportSlot))
++    FatalF("%s", err.c_str());
+ 
+   if (p.x64) {
+     // Everything above 4 GiB, below the TEBs.
+@@ -195,6 +226,9 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
    // Dispatch looks lifted code up in each image's .text: the EXE's first.
    p.code.push_back(TextOf(w.img));
    for (const Module& m : w.modules) p.code.push_back(TextOf(m.img));
@@ -83,6 +204,78 @@ index eb0bd8d..446ddf0 100644
    InitDispatch();
    for (const Module& m : w.modules) {
      // A DLL lifted at another base, or not at all, has no functions here.
+@@ -207,7 +241,18 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
+   InitKernel32State();
+ 
+   Thread* main = CreateGuestThread(w.img.stack_reserve);
+-  return int(RunMainThread(main, [&](Ctx& c) { return CallGuest(c, w.img.entry, {}); }));
++  return int(RunMainThread(main, [&](Ctx& c) {
++    // DLL_PROCESS_ATTACH of statically imported DLLs, in load order, as
++    // the Windows loader runs them before the EXE's entry point.
++    for (Module& m : w.modules) {
++      if (!m.static_import || !m.img.entry) continue;
++      m.refs = 1;
++      m.stale = true;
++      if (!uint32_t(CallGuest(c, m.img.entry, {m.img.image_base, 1, 0})))
++        FatalF("%s: DllMain(DLL_PROCESS_ATTACH) failed", m.name.c_str());
++    }
++    return CallGuest(c, w.img.entry, {});
++  }));
+ }
+ 
+ }  // namespace recomp
+diff --git a/platforms/win32/src/win32/process.h b/platforms/win32/src/win32/process.h
+index f3aaec5..64080de 100644
+--- a/platforms/win32/src/win32/process.h
++++ b/platforms/win32/src/win32/process.h
+@@ -62,6 +62,12 @@ struct GameConfig : recomp::GameConfig {
+   struct LiftedDll {
+     std::string name;   // file name, e.g. "game.dll"
+     uint32_t base = 0;  // the lifter's --base for it; 0 = preferred base
++    // Imported by the EXE or by another lifted DLL, not only loaded with
++    // LoadLibrary (e.g. the C runtime DLL of the compiler the game was
++    // built with): mapped before the EXE, in list order (a DLL after the
++    // DLLs it imports), its exports bound into its importers' IATs, and
++    // its DllMain run before the EXE's entry point. It is never unloaded.
++    bool static_import = false;
+   };
+   std::vector<LiftedDll> lifted_dlls;
+ };
+@@ -94,6 +100,7 @@ struct Module {
+   int refs = 0;        // LoadLibrary count (under kernel32's loader lock)
+   bool stale = false;  // has run since it was mapped: map afresh on load
+   int tls_index = -1;  // its static TLS slot (x64 guests), -1: none
++  bool static_import = false;  // GameConfig::LiftedDll::static_import
+ };
+ 
+ // The Win32 side of g_proc.
+diff --git a/platforms/win32/src/win32/user32_window.cpp b/platforms/win32/src/win32/user32_window.cpp
+index ce8f08b..bba5bd3 100644
+--- a/platforms/win32/src/win32/user32_window.cpp
++++ b/platforms/win32/src/win32/user32_window.cpp
+@@ -1593,6 +1593,22 @@ HLE("user32.dll", SetWindowTextA, 2) {
+   return 1;
+ }
+ 
++// The window keeps its title in the ANSI code page (GetWindowTextA).
++HLE("user32.dll", SetWindowTextW, 2) {
++  std::u16string wt = GWStr(Arg(c, 1));
++  SDL_Window* s = nullptr;
++  {
++    std::lock_guard<std::recursive_mutex> l(g_mu);
++    Window* w = Win(Arg(c, 0));
++    if (!w) return 0;
++    w->title = Narrow(wt);
++    s = w->sdl;
++  }
++  bool bad = false;
++  if (s) SDL_SetWindowTitle(s, Utf16ToUtf8(wt.data(), wt.size(), &bad).c_str());
++  return 1;
++}
++
+ HLE("user32.dll", GetWindowTextA, 3) {
+   std::lock_guard<std::recursive_mutex> l(g_mu);
+   Window* w = Win(Arg(c, 0));
 diff --git a/tools/lifter_x86/main.cpp b/tools/lifter_x86/main.cpp
 index cc4778c..3bd98fa 100644
 --- a/tools/lifter_x86/main.cpp
