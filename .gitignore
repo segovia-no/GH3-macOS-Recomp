@@ -24,9 +24,6 @@
 /third_party/
 /ref/
 
-# Old local layout (before build/).
-/work/
-
 # Local tool and editor state
 .DS_Store
 __pycache__/
