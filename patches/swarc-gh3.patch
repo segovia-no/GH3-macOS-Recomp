@@ -2189,7 +2189,7 @@ index af56713..e8e4944 100644
    return g_main_exit;
  }
 diff --git a/src/x86/sse.cpp b/src/x86/sse.cpp
-index 19e4386..11bbf0c 100644
+index 19e4386..212449a 100644
 --- a/src/x86/sse.cpp
 +++ b/src/x86/sse.cpp
 @@ -10,6 +10,10 @@
@@ -2203,123 +2203,30 @@ index 19e4386..11bbf0c 100644
  extern "C" {
  #include "softfloat.h"
  }
-@@ -175,9 +179,106 @@ void SqrtT(Ctx& c, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
-   d = r;
- }
- 
-+// ---- Host fast path for add/sub/mul/div -----------------------------------
-+// Under MXCSR's default control (round to nearest, all exceptions masked,
-+// no FTZ or DAZ), with operands that are normal or zero, an operation whose
-+// host result is finite and normal gives the same bits on any IEEE-754
-+// binary32/64 unit rounding to nearest: both are the correctly rounded
-+// exact value. Its only possible flag is PE (inexact), computed exactly
-+// from the rounding error: TwoSum for add/sub (exact for any finite sum),
-+// an FMA residual for mul/div (exactly representable while the result and
-+// the dividend stay at least 2^p above the underflow threshold, checked).
-+// A zero result is taken only from add/sub (exact cancellation, sign as
-+// IEEE rounding to nearest gives it) or from a zero operand. Everything
-+// else (NaNs, infinities, a zero divisor, denormal operands, overflow,
-+// results near or below the underflow threshold) goes to SoftFloat. Needs
-+// the host's default floating-point environment (round to nearest, no
-+// flush to zero) and no FMA contraction (RECOMP_X87_FP_FLAGS).
-+// tests/x86/sse_fast_test compares it with the SoftFloat path.
-+
-+bool g_fast = true;
-+constexpr uint32_t kControlMask = 0xFFC0, kDefaultControl = 0x1F80;
-+
-+template <bool D>
-+using HostT = std::conditional_t<D, double, float>;
-+
-+template <bool D>
-+bool NormalOrZero(typename Fmt<D>::U v) {
-+  const typename Fmt<D>::U e = v & Fmt<D>::kExp;
-+  return e != Fmt<D>::kExp && (e != 0 || !(v & Fmt<D>::kFrac));
-+}
-+
-+template <bool D>
-+bool FastLane(Op op, typename Fmt<D>::U a, typename Fmt<D>::U b, typename Fmt<D>::U* out,
-+              bool* inexact) {
-+  using U = typename Fmt<D>::U;
-+  using T = HostT<D>;
-+  // 2^p above the smallest normal: below it an FMA residual could round.
-+  const T kSafe = D ? 0x1p-969 : 0x1p-102f;
-+  if (!NormalOrZero<D>(a) || !NormalOrZero<D>(b)) return false;
-+  const T x = std::bit_cast<T>(a), y = std::bit_cast<T>(b);
-+  T r;
-+  bool inex = false;
-+  switch (op) {
-+    case kAdd:
-+    case kSub: {
-+      const T yy = op == kAdd ? y : -y;
-+      r = x + yy;
-+      const T bv = r - x, av = r - bv;
-+      inex = ((x - av) + (yy - bv)) != 0;
-+      break;
-+    }
-+    case kMul:
-+      r = x * y;
-+      if (r != 0) {
-+        if (std::fabs(r) < kSafe) return false;
-+        inex = std::fma(x, y, -r) != 0;
-+      } else if (x != 0 && y != 0) {
-+        return false;  // underflow to zero
-+      }
-+      break;
-+    default:
-+      if (y == 0) return false;  // ZE / IE
-+      r = x / y;
-+      if (r != 0) {
-+        if (std::fabs(r) < kSafe || std::fabs(x) < kSafe) return false;
-+        inex = std::fma(r, y, -x) != 0;
-+      } else if (x != 0) {
-+        return false;  // underflow to zero
-+      }
-+      break;
-+  }
-+  const U rb = std::bit_cast<U>(r);
-+  const U e = rb & Fmt<D>::kExp;
-+  if (e == Fmt<D>::kExp) return false;                    // overflow
-+  if (e == 0 && (rb & Fmt<D>::kFrac)) return false;       // denormal: underflow
-+  *out = rb;
-+  *inexact = inex;
-+  return true;
-+}
-+
-+template <bool D>
-+bool FastArith(Ctx& c, Op op, int lanes, Xmm& d, const Xmm& s) {
-+  using U = typename Fmt<D>::U;
-+  if (!g_fast || (c.mxcsr & kControlMask) != kDefaultControl) return false;
-+  Xmm r = d;
-+  bool inexact = false;
-+  for (int i = 0; i < lanes; i++) {
-+    U o;
-+    bool ix;
-+    if (!FastLane<D>(op, Lane<U>(d, i), Lane<U>(s, i), &o, &ix)) return false;
-+    SetLane<U>(r, i, o);
-+    inexact |= ix;
-+  }
-+  if (inexact) c.mxcsr |= kPE;
-+  d = r;
-+  return true;
-+}
-+
- template <bool D>
- void ArithT(Ctx& c, Op op, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
-   using U = typename Fmt<D>::U;
-+  if (FastArith<D>(c, op, lanes, d, s)) return;
-   Scope sc(c, va);
-   Xmm r = d;
-   for (int i = 0; i < lanes; i++)
-@@ -306,6 +407,8 @@ void CheckAligned(Ctx& c, uint64_t a, uint64_t va, unsigned align) {
+@@ -306,8 +310,11 @@ void CheckAligned(Ctx& c, uint64_t a, uint64_t va, unsigned align) {
             (unsigned long long)a, (unsigned long long)va);
  }
  
-+void SetFastPath(bool on) { g_fast = on; }
+-void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
+-           uint64_t va) {
++bool g_fast_path = true;
++void SetFastPath(bool on) { g_fast_path = on; }
 +
- void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
-            uint64_t va) {
++void ArithExact(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
++                uint64_t va) {
    if (dbl)
-@@ -373,6 +476,26 @@ uint32_t RsqrtLane(uint32_t x) {
+     ArithT<true>(c, op, lanes, d, s, va);
+   else
+@@ -327,7 +334,7 @@ int Comi(Ctx& c, bool dbl, bool ordered, const Xmm& a, const Xmm& b,
+   return dbl ? ComiT<true>(c, ordered, a, b, va) : ComiT<false>(c, ordered, a, b, va);
+ }
+ 
+-void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
++void SqrtExact(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+   if (dbl)
+     SqrtT<true>(c, lanes, d, s, va);
+   else
+@@ -373,6 +380,26 @@ uint32_t RsqrtLane(uint32_t x) {
    }
  }
  
@@ -2346,55 +2253,32 @@ index 19e4386..11bbf0c 100644
  void Rsqrt(Xmm& d, const Xmm& s) {
    Xmm r;
    for (int i = 0; i < 4; i++) SetLane<uint32_t>(r, i, RsqrtLane(Lane<uint32_t>(s, i)));
-@@ -421,7 +544,41 @@ void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
+@@ -413,15 +440,15 @@ uint64_t CvtToI64(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va) {
+   return uint64_t(r);
+ }
+ 
+-void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
+-            uint64_t va) {
++void MinMaxExact(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
++                 uint64_t va) {
+   if (dbl)
+     MinMaxT<true>(c, max, lanes, d, s, va);
+   else
      MinMaxT<false>(c, max, lanes, d, s, va);
  }
  
-+// Host fast path (see "Host fast path" above): float to double is exact
-+// for a normal or zero operand (no flags); double to float rounds to
-+// nearest on the host as SoftFloat does, inexact iff the float does not
-+// convert back to the same double, taken only when the result is normal
-+// (or the operand zero).
-+bool FastCvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s) {
-+  if (!g_fast || (c.mxcsr & kControlMask) != kDefaultControl) return false;
-+  Xmm r = d;
-+  bool inexact = false;
-+  for (int i = 0; i < lanes; i++) {
-+    if (to_dbl) {
-+      const uint32_t a = Lane<uint32_t>(s, i);
-+      if (!NormalOrZero<false>(a)) return false;
-+      SetLane<uint64_t>(r, i, std::bit_cast<uint64_t>(double(std::bit_cast<float>(a))));
-+    } else {
-+      const uint64_t a = Lane<uint64_t>(s, i);
-+      if (!NormalOrZero<true>(a)) return false;
-+      const double x = std::bit_cast<double>(a);
-+      const float f = float(x);
-+      const uint32_t fb = std::bit_cast<uint32_t>(f);
-+      const uint32_t e = fb & Fmt<false>::kExp;
-+      if (e == Fmt<false>::kExp) return false;      // overflow
-+      if (e == 0 && x != 0) return false;           // underflow (denormal or zero)
-+      inexact |= double(f) != x;
-+      SetLane<uint32_t>(r, i, fb);
-+    }
-+  }
-+  if (!to_dbl && lanes == 2) SetLane<uint64_t>(r, 1, 0);  // CVTPD2PS zeroes the top
-+  if (inexact) c.mxcsr |= kPE;
-+  d = r;
-+  return true;
-+}
-+
- void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
-+  if (FastCvtFloat(c, to_dbl, lanes, d, s)) return;
+-void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
++void CvtFloatExact(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
    Scope sc(c, va);
    Xmm r = d;
    if (to_dbl) {
-@@ -437,6 +594,19 @@ void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va)
+@@ -437,6 +464,19 @@ void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va)
  }
  
  void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va) {
 +  // Host fast path for 32-bit sources: int32 to double is exact; to float
 +  // rounds to nearest like SoftFloat, inexact iff it does not convert back.
-+  if (g_fast && !src64 && (c.mxcsr & kControlMask) == kDefaultControl) {
++  if (g_fast_path && !src64 && (c.mxcsr & 0xFFC0) == kMxcsrDefault) {
 +    const int32_t i = int32_t(v);
 +    if (dbl) {
 +      SetLane<uint64_t>(d, 0, std::bit_cast<uint64_t>(double(i)));
@@ -2409,7 +2293,7 @@ index 19e4386..11bbf0c 100644
    sc.Begin();
    if (dbl)
 diff --git a/src/x86/sse.h b/src/x86/sse.h
-index 3622a7a..ab75d5f 100644
+index 3622a7a..909564f 100644
 --- a/src/x86/sse.h
 +++ b/src/x86/sse.h
 @@ -14,6 +14,7 @@
@@ -2420,20 +2304,55 @@ index 3622a7a..ab75d5f 100644
  //
  // Only the forms the supported games use are implemented; the lifter
  // reports the rest as unimplemented.
-@@ -59,7 +60,11 @@ void CheckAligned(Ctx& c, uint64_t a, uint64_t va, unsigned align);
+@@ -24,6 +25,7 @@
+ #include <type_traits>
+ 
+ #include "x86/ctx.h"
++#include "x86/sse_fast.h"
+ 
+ namespace recomp::sse {
+ 
+@@ -58,10 +60,24 @@ void CheckAligned(Ctx& c, uint64_t a, uint64_t va, unsigned align);
+ // ---- floating point ---------------------------------------------------
  enum Op : uint8_t { kAdd, kSub, kMul, kDiv };
  
- // d = d op s, lane-wise: `lanes` lanes of double (dbl) or float. Scalar
--// forms pass lanes = 1 and keep the upper lanes of d.
-+// forms pass lanes = 1 and keep the upper lanes of d. Under MXCSR's default
-+// control, normal-or-zero operands with a normal result take a host-float
-+// fast path that gives the same bits and flags (sse.cpp, "Host fast path";
-+// tests/x86/sse_fast_test). SetFastPath(false) turns it off (tests).
++// Arith, Sqrt, MinMax and CvtFloat try sse_fast.h's host fast path first
++// (same bits and flags; inline in lifted code) and fall back to the exact
++// *Exact functions. SetFastPath(false) sends everything to them (tests).
 +void SetFastPath(bool on);
- void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
-            uint64_t va);
++
+ // d = d op s, lane-wise: `lanes` lanes of double (dbl) or float. Scalar
+ // forms pass lanes = 1 and keep the upper lanes of d.
+-void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
+-           uint64_t va);
++void ArithExact(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
++inline void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
++  bool done;
++  switch (op) {
++    case kAdd: done = dbl ? fast::Arith<true, 0>(c, lanes, d, s) : fast::Arith<false, 0>(c, lanes, d, s); break;
++    case kSub: done = dbl ? fast::Arith<true, 1>(c, lanes, d, s) : fast::Arith<false, 1>(c, lanes, d, s); break;
++    case kMul: done = dbl ? fast::Arith<true, 2>(c, lanes, d, s) : fast::Arith<false, 2>(c, lanes, d, s); break;
++    default: done = dbl ? fast::Arith<true, 3>(c, lanes, d, s) : fast::Arith<false, 3>(c, lanes, d, s); break;
++  }
++  if (!done) ArithExact(c, op, dbl, lanes, d, s, va);
++}
  
-@@ -84,6 +89,13 @@ void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
+ // CMPPS/PD/SS/SD: each lane of d becomes all ones if `d pred s` holds,
+ // else zero. pred is the imm8 (0 EQ, 1 LT, 2 LE, 3 UNORD, 4 NEQ, 5 NLT,
+@@ -76,7 +92,11 @@ int Comi(Ctx& c, bool dbl, bool ordered, const Xmm& a, const Xmm& b,
+ 
+ // SQRTSD/SQRTSS/SQRTPD/SQRTPS: d = sqrt(s), lane-wise; scalar forms keep
+ // the upper lanes of d.
+-void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
++void SqrtExact(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
++inline void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
++  if (!(dbl ? fast::Sqrt<true>(c, lanes, d, s) : fast::Sqrt<false>(c, lanes, d, s)))
++    SqrtExact(c, dbl, lanes, d, s, va);
++}
+ 
+ // RSQRTPS: d = 1/sqrt(s) in all four float lanes (see above). No flags:
+ // ±0 and denormals give ±inf, negative values the default NaN, +inf +0,
+@@ -84,6 +104,13 @@ void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
  void Rsqrt(Xmm& d, const Xmm& s);
  uint32_t RsqrtLane(uint32_t x);
  
@@ -2447,7 +2366,29 @@ index 3622a7a..ab75d5f 100644
  // CVTSI2SD: the low lane of d = (double)v (always exact).
  void Cvtsi2sd(Xmm& d, int32_t v);
  
-@@ -113,6 +125,11 @@ void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va);
+@@ -96,12 +123,18 @@ uint64_t CvtToI64(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va);
+ // MINSS/SD/PS/PD (max = false) and MAXSS/SD/PS/PD, lane-wise: d op s ? d : s.
+ // A NaN in either operand (invalid, quiet ones too) or equal values,
+ // zeros of either sign included, give s. Scalar forms keep d's upper lanes.
+-void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
+-            uint64_t va);
++void MinMaxExact(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
++inline void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
++  if (!(dbl ? fast::MinMax<true>(c, max, lanes, d, s) : fast::MinMax<false>(c, max, lanes, d, s)))
++    MinMaxExact(c, max, dbl, lanes, d, s, va);
++}
+ 
+ // CVTSS2SD / CVTPS2PD (to_dbl, 1 or 2 lanes) and CVTSD2SS / CVTPD2PS.
+ // Scalar forms keep d's other lanes; CVTPD2PS zeroes its upper half.
+-void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
++void CvtFloatExact(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
++inline void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
++  if (!fast::CvtFloat(c, to_dbl, lanes, d, s)) CvtFloatExact(c, to_dbl, lanes, d, s, va);
++}
+ 
+ // CVTSI2SS / CVTSI2SD of a 32-bit or 64-bit (src64) integer into the low
+ // lane, rounded by MXCSR (only int64 -> double and int -> float can be
+@@ -113,6 +146,11 @@ void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va);
  // int32, 0x80000000 for NaN and out of range (invalid).
  void CvtToDq(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s, uint64_t va);
  
@@ -2459,6 +2400,212 @@ index 3622a7a..ab75d5f 100644
  // RSQRTSS: the low lane of d = 1/sqrt(the low lane of s), as RsqrtLane.
  inline void RsqrtSs(Xmm& d, const Xmm& s) {
    SetLane<uint32_t>(d, 0, RsqrtLane(Lane<uint32_t>(s, 0)));
+diff --git a/src/x86/sse_fast.h b/src/x86/sse_fast.h
+new file mode 100644
+index 0000000..85a8f7c
+--- /dev/null
++++ b/src/x86/sse_fast.h
+@@ -0,0 +1,200 @@
++// Host fast paths for SSE floating point, inline so lifted code gets them
++// without a call (sse.h's Arith, Sqrt, MinMax and CvtFloat try these first
++// and fall back to the exact SoftFloat paths in sse.cpp).
++//
++// Under MXCSR's default control (round to nearest, all exceptions masked,
++// no FTZ or DAZ), with operands that are normal or zero, an operation whose
++// host result is finite and normal gives the same bits on any IEEE-754
++// binary32/64 unit rounding to nearest: both are the correctly rounded
++// exact value. The only flag such an operation can raise is PE (inexact),
++// computed exactly from the rounding error:
++// - add/sub: TwoSum, exact for any finite sum;
++// - mul/div/sqrt: an FMA residual, exactly representable while the values
++//   stay 2^p above the underflow threshold (checked);
++// - double to float: whether the float converts back to the same double.
++// A zero result is taken only from add/sub (exact cancellation, its sign
++// as IEEE rounding to nearest gives it) or from zero operands. Everything
++// else (NaNs, infinities, a zero divisor, denormal operands, negative
++// square roots, overflow, results near or below the underflow threshold)
++// takes the exact path. MINPS/MAXPS need no arithmetic: with normal or zero
++// operands they only compare (equal values, zeros of either sign too, give
++// the source). Needs the host's default floating-point environment (round
++// to nearest, no flush to zero) and no FMA contraction: lifted code and
++// sse.cpp are built with RECOMP_X87_FP_FLAGS. tests/x86/sse_fast_test
++// compares every path with the exact one.
++
++#pragma once
++
++#include <bit>
++#include <cmath>
++#include <cstdint>
++#include <type_traits>
++
++#include "x86/ctx.h"
++
++namespace recomp::sse {
++
++// SetFastPath (tests): false sends everything to the exact paths.
++extern bool g_fast_path;
++
++namespace fast {
++
++inline constexpr uint32_t kControlMask = 0xFFC0, kDefaultControl = 0x1F80, kPE = 0x20;
++
++template <bool D>
++struct Bits {
++  using U = std::conditional_t<D, uint64_t, uint32_t>;
++  using T = std::conditional_t<D, double, float>;
++  static constexpr U kExp = D ? U(0x7FF0000000000000ull) : U(0x7F800000u);
++  static constexpr U kFrac = D ? U(0x000FFFFFFFFFFFFFull) : U(0x007FFFFFu);
++  // 2^p above the smallest normal: below it an FMA residual could round.
++  static constexpr T kSafe = D ? T(0x1p-969) : T(0x1p-102f);
++  // For square roots the residual scales with the operand: 2^2p above.
++  static constexpr T kSafeSqrt = D ? T(0x1p-916) : T(0x1p-78f);
++};
++
++template <bool D>
++inline bool NormalOrZero(typename Bits<D>::U v) {
++  const typename Bits<D>::U e = v & Bits<D>::kExp;
++  return e != Bits<D>::kExp && (e != 0 || !(v & Bits<D>::kFrac));
++}
++
++// A finite, normal or zero result.
++template <bool D>
++inline bool NormalResult(typename Bits<D>::U r) {
++  const typename Bits<D>::U e = r & Bits<D>::kExp;
++  return e != Bits<D>::kExp && (e != 0 || !(r & Bits<D>::kFrac));
++}
++
++template <bool D, int Op>  // Op: sse::Op (kAdd, kSub, kMul, kDiv)
++inline bool ArithLane(typename Bits<D>::U a, typename Bits<D>::U b, typename Bits<D>::U* out,
++                      bool* inexact) {
++  using T = typename Bits<D>::T;
++  using U = typename Bits<D>::U;
++  if (!NormalOrZero<D>(a) || !NormalOrZero<D>(b)) return false;
++  const T x = std::bit_cast<T>(a), y = std::bit_cast<T>(b);
++  T r;
++  bool inex = false;
++  if constexpr (Op == 0 || Op == 1) {
++    const T yy = Op == 0 ? y : -y;
++    r = x + yy;
++    const T bv = r - x, av = r - bv;
++    inex = ((x - av) + (yy - bv)) != 0;
++  } else if constexpr (Op == 2) {
++    r = x * y;
++    if (r != 0) {
++      if (std::fabs(r) < Bits<D>::kSafe) return false;
++      inex = std::fma(x, y, -r) != 0;
++    } else if (x != 0 && y != 0) {
++      return false;  // underflow to zero
++    }
++  } else {
++    if (y == 0) return false;  // ZE / IE
++    r = x / y;
++    if (r != 0) {
++      if (std::fabs(r) < Bits<D>::kSafe || std::fabs(x) < Bits<D>::kSafe) return false;
++      inex = std::fma(r, y, -x) != 0;
++    } else if (x != 0) {
++      return false;  // underflow to zero
++    }
++  }
++  const U rb = std::bit_cast<U>(r);
++  if (!NormalResult<D>(rb)) return false;  // overflow or underflow
++  *out = rb;
++  *inexact |= inex;
++  return true;
++}
++
++template <bool D, int Op>
++inline bool Arith(Ctx& c, int lanes, Xmm& d, const Xmm& s) {
++  using U = typename Bits<D>::U;
++  if (!g_fast_path || (c.mxcsr & kControlMask) != kDefaultControl) return false;
++  U r[4];
++  bool inexact = false;
++  for (int i = 0; i < lanes; i++) {
++    U a, b;
++    __builtin_memcpy(&a, d.b + i * sizeof(U), sizeof(U));
++    __builtin_memcpy(&b, s.b + i * sizeof(U), sizeof(U));
++    if (!ArithLane<D, Op>(a, b, &r[i], &inexact)) return false;
++  }
++  __builtin_memcpy(d.b, r, size_t(lanes) * sizeof(U));
++  if (inexact) c.mxcsr |= kPE;
++  return true;
++}
++
++template <bool D>
++inline bool Sqrt(Ctx& c, int lanes, Xmm& d, const Xmm& s) {
++  using T = typename Bits<D>::T;
++  using U = typename Bits<D>::U;
++  if (!g_fast_path || (c.mxcsr & kControlMask) != kDefaultControl) return false;
++  U r[4];
++  bool inexact = false;
++  for (int i = 0; i < lanes; i++) {
++    U a;
++    __builtin_memcpy(&a, s.b + i * sizeof(U), sizeof(U));
++    if (!NormalOrZero<D>(a)) return false;
++    const T x = std::bit_cast<T>(a);
++    if (x < 0) return false;  // IE
++    if (x != 0 && x < Bits<D>::kSafeSqrt) return false;
++    const T q = std::sqrt(x);  // ±0 stays ±0
++    if (x != 0) inexact |= std::fma(q, q, -x) != 0;
++    r[i] = std::bit_cast<U>(q);
++  }
++  __builtin_memcpy(d.b, r, size_t(lanes) * sizeof(U));
++  if (inexact) c.mxcsr |= kPE;
++  return true;
++}
++
++template <bool D>
++inline bool MinMax(Ctx& c, bool max, int lanes, Xmm& d, const Xmm& s) {
++  using T = typename Bits<D>::T;
++  using U = typename Bits<D>::U;
++  if (!g_fast_path || (c.mxcsr & kControlMask) != kDefaultControl) return false;
++  U r[4];
++  for (int i = 0; i < lanes; i++) {
++    U a, b;
++    __builtin_memcpy(&a, d.b + i * sizeof(U), sizeof(U));
++    __builtin_memcpy(&b, s.b + i * sizeof(U), sizeof(U));
++    if (!NormalOrZero<D>(a) || !NormalOrZero<D>(b)) return false;
++    const T x = std::bit_cast<T>(a), y = std::bit_cast<T>(b);
++    r[i] = (max ? x > y : x < y) ? a : b;
++  }
++  __builtin_memcpy(d.b, r, size_t(lanes) * sizeof(U));
++  return true;
++}
++
++inline bool CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s) {
++  if (!g_fast_path || (c.mxcsr & kControlMask) != kDefaultControl) return false;
++  if (to_dbl) {
++    uint64_t r[2];
++    for (int i = 0; i < lanes; i++) {
++      uint32_t a;
++      __builtin_memcpy(&a, s.b + i * 4, 4);
++      if (!NormalOrZero<false>(a)) return false;
++      r[i] = std::bit_cast<uint64_t>(double(std::bit_cast<float>(a)));
++    }
++    __builtin_memcpy(d.b, r, size_t(lanes) * 8);
++    return true;
++  }
++  uint32_t r[2];
++  bool inexact = false;
++  for (int i = 0; i < lanes; i++) {
++    uint64_t a;
++    __builtin_memcpy(&a, s.b + i * 8, 8);
++    if (!NormalOrZero<true>(a)) return false;
++    const double x = std::bit_cast<double>(a);
++    const float f = float(x);
++    const uint32_t fb = std::bit_cast<uint32_t>(f);
++    if ((fb & 0x7F800000u) == 0x7F800000u) return false;  // overflow
++    if (!(fb & 0x7F800000u) && x != 0) return false;      // underflow
++    inexact |= double(f) != x;
++    r[i] = fb;
++  }
++  __builtin_memcpy(d.b, r, size_t(lanes) * 4);
++  if (lanes == 2) __builtin_memset(d.b + 8, 0, 8);  // CVTPD2PS zeroes the top
++  if (inexact) c.mxcsr |= kPE;
++  return true;
++}
++
++}  // namespace fast
++}  // namespace recomp::sse
 diff --git a/tests/x86/CMakeLists.txt b/tests/x86/CMakeLists.txt
 index 6f096e8..94357c9 100644
 --- a/tests/x86/CMakeLists.txt
@@ -2484,12 +2631,12 @@ index 6f096e8..94357c9 100644
  add_executable(hle_abi_test hle_abi_test.cpp)
 diff --git a/tests/x86/sse_fast_test.cpp b/tests/x86/sse_fast_test.cpp
 new file mode 100644
-index 0000000..92d4e06
+index 0000000..c162a0c
 --- /dev/null
 +++ b/tests/x86/sse_fast_test.cpp
-@@ -0,0 +1,142 @@
-+// The host fast paths of sse::Arith, CvtFloat and CvtIntToF (sse.cpp,
-+// "Host fast path") against the SoftFloat paths: random add/sub/mul/div of float and double lanes, biased
+@@ -0,0 +1,176 @@
++// The host fast paths (sse_fast.h; CvtIntToF's in sse.cpp) of Arith,
++// Sqrt, MinMax, CvtFloat and CvtIntToF against the exact SoftFloat paths: random add/sub/mul/div of float and double lanes, biased
 +// towards the edges of the fast path (near overflow and underflow, exact
 +// cancellation, zeros, denormals, NaNs and infinities, sticky flags already
 +// set), must give the same result bits and the same MXCSR.
@@ -2526,7 +2673,7 @@ index 0000000..92d4e06
 +  const uint64_t emax = (1ull << ebits) - 1;
 +  uint64_t sign = Rand() & 1, frac = Rand() & ((1ull << fbits) - 1), exp;
 +  switch (Rand() % 10) {
-+    case 0: exp = 0; break;                                   // zero or denormal
++    case 0: exp = 0; if (Rand() & 1) frac = 0; break;         // zero or denormal
 +    case 1: exp = emax; break;                                // inf or NaN
 +    case 2: exp = 1 + Rand() % 4; break;                      // just above underflow
 +    case 3: exp = emax - 1 - Rand() % 4; break;               // just below overflow
@@ -2576,6 +2723,38 @@ index 0000000..92d4e06
 +  }
 +}
 +
++template <bool D>
++void CheckUnary(int kind, int lanes) {  // kind: 0 sqrt, 1 min, 2 max
++  uint64_t a[4], b[4];
++  for (int i = 0; i < lanes; i++) {
++    a[i] = Operand<D>();
++    // Equal values, and the same magnitude with the other sign (+0/-0).
++    const uint64_t sign = D ? 0x8000000000000000ull : 0x80000000ull;
++    b[i] = Rand() % 6 == 0 ? a[i] : Rand() % 6 == 0 ? a[i] ^ sign : Operand<D>();
++    // Square roots of mostly positive values.
++    if (kind == 0 && Rand() % 4) a[i] &= D ? 0x7FFFFFFFFFFFFFFFull : 0x7FFFFFFFull;
++  }
++  recomp::Xmm d0{}, s{};
++  SetLanes<D>(d0, a, lanes);
++  SetLanes<D>(s, kind == 0 ? a : b, lanes);
++  recomp::Ctx c1{}, c2{};
++  c1.mxcsr = c2.mxcsr = 0x1F80;
++  recomp::Xmm d1 = d0, d2 = d0;
++  for (int pass = 0; pass < 2; pass++) {
++    recomp::sse::SetFastPath(pass == 0);
++    recomp::Ctx& c = pass == 0 ? c1 : c2;
++    recomp::Xmm& d = pass == 0 ? d1 : d2;
++    if (kind == 0)
++      recomp::sse::Sqrt(c, D, lanes, d, s, 0);
++    else
++      recomp::sse::MinMax(c, kind == 2, D, lanes, d, s, 0);
++  }
++  if ((std::memcmp(&d1, &d2, sizeof d1) != 0 || c1.mxcsr != c2.mxcsr) && ++g_fail <= 20)
++    std::printf("FAIL %s kind %d lanes %d: a0 %llx b0 %llx mxcsr fast %x exact %x\n",
++                D ? "double" : "float", kind, lanes, (unsigned long long)a[0],
++                (unsigned long long)b[0], c1.mxcsr, c2.mxcsr);
++}
++
 +void CheckCvt(bool to_dbl, int lanes) {
 +  recomp::Xmm s{}, d0{};
 +  for (int i = 0; i < lanes; i++) {
@@ -2621,6 +2800,8 @@ index 0000000..92d4e06
 +    Check<false>(op, i % 3 == 0 ? 4 : 1);
 +    Check<true>(op, i % 3 == 0 ? 2 : 1);
 +    CheckCvt(i & 1, i % 3 == 0 ? 2 : 1);
++    CheckUnary<false>(i % 3, i % 3 == 0 ? 4 : 1);
++    CheckUnary<true>(i % 3, i % 3 == 0 ? 2 : 1);
 +    CheckIntCvt(i & 1);
 +  }
 +  if (g_fail) {
