@@ -1,0 +1,178 @@
+diff --git a/platforms/win32/lifter/pe_reader.cpp b/platforms/win32/lifter/pe_reader.cpp
+index 5e5d480..e6dfe6b 100644
+--- a/platforms/win32/lifter/pe_reader.cpp
++++ b/platforms/win32/lifter/pe_reader.cpp
+@@ -13,6 +13,8 @@
+ namespace lifter {
+ namespace {
+ 
++constexpr uint32_t kScnMemExecute = 0x20000000;  // IMAGE_SCN_MEM_EXECUTE
++
+ bool Match(const std::string& path, bool* x64) {
+   std::ifstream f(path, std::ios::binary);
+   char mz[2] = {};
+@@ -53,10 +55,12 @@ bool Load(Program& p, Module& m, const std::string& path, uint64_t base, std::st
+     if (s.name == ".text") {
+       m.text_lo = s.va;
+       m.text_hi = s.va + s.vsize;
++    } else if (s.characteristics & kScnMemExecute) {
++      m.extra_text.push_back({s.va, s.va + s.vsize});
+     }
+     if (s.name == ".rdata" || s.name == ".data") m.data.push_back({s.va, s.va + s.vsize});
+   }
+-  auto in_text = [&](uint64_t va) { return va >= m.text_lo && va < m.text_hi; };
++  auto in_text = [&](uint64_t va) { return m.HasCode(va); };
+ 
+   // x64: every .pdata entry that is not a chained fragment starts a
+   // function (ARCHITECTURE.md, "64-bit guests"); those with a language
+diff --git a/platforms/win32/src/win32/kernel32.cpp b/platforms/win32/src/win32/kernel32.cpp
+index 2a04eb3..91dc443 100644
+--- a/platforms/win32/src/win32/kernel32.cpp
++++ b/platforms/win32/src/win32/kernel32.cpp
+@@ -996,6 +996,22 @@ HLE("kernel32.dll", InterlockedExchange, 2) {
+   return __atomic_exchange_n(reinterpret_cast<uint32_t*>(GPtr(Arg(c, 0))),
+                              Arg(c, 1), __ATOMIC_SEQ_CST);
+ }
++// Returns the value before the add.
++HLE("kernel32.dll", InterlockedExchangeAdd, 2) {
++  GuestSyncPoint sync;
++  return __atomic_fetch_add(reinterpret_cast<uint32_t*>(GPtr(Arg(c, 0))),
++                            Arg(c, 1), __ATOMIC_SEQ_CST);
++}
++// (Destination, Exchange, Comperand): returns the initial value; stores
++// Exchange only if it equalled Comperand.
++HLE("kernel32.dll", InterlockedCompareExchange, 3) {
++  GuestSyncPoint sync;
++  uint32_t expected = Arg(c, 2);
++  __atomic_compare_exchange_n(reinterpret_cast<uint32_t*>(GPtr(Arg(c, 0))),
++                              &expected, Arg(c, 1), false, __ATOMIC_SEQ_CST,
++                              __ATOMIC_SEQ_CST);
++  return expected;
++}
+ 
+ // ---- time ----------------------------------------------------------------
+ 
+diff --git a/platforms/win32/src/win32/process.cpp b/platforms/win32/src/win32/process.cpp
+index eb0bd8d..446ddf0 100644
+--- a/platforms/win32/src/win32/process.cpp
++++ b/platforms/win32/src/win32/process.cpp
+@@ -36,6 +36,16 @@ std::pair<gaddr, uint64_t> TextOf(const PeImage& img) {
+   return {0, 0};
+ }
+ 
++// The image's other executable sections: code a protector's unwrapper
++// moved out of .text, lifted like .text (the lifter's PE reader).
++std::vector<std::pair<gaddr, uint64_t>> ExtraCodeOf(const PeImage& img) {
++  std::vector<std::pair<gaddr, uint64_t>> r;
++  for (const auto& s : img.sections)
++    if (s.name != ".text" && (s.characteristics & 0x20000000))  // MEM_EXECUTE
++      r.push_back({s.va, s.vsize});
++  return r;
++}
++
+ // Process::thread_init: the thread's TEB and TLS array, in the layout of
+ // the process's mode, found through fs (32-bit) or gs (x64).
+ void InitTeb(Thread* t) {
+@@ -195,6 +205,9 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
+   // Dispatch looks lifted code up in each image's .text: the EXE's first.
+   p.code.push_back(TextOf(w.img));
+   for (const Module& m : w.modules) p.code.push_back(TextOf(m.img));
++  for (const auto& r : ExtraCodeOf(w.img)) p.code.push_back(r);
++  for (const Module& m : w.modules)
++    for (const auto& r : ExtraCodeOf(m.img)) p.code.push_back(r);
+   InitDispatch();
+   for (const Module& m : w.modules) {
+     // A DLL lifted at another base, or not at all, has no functions here.
+diff --git a/tools/lifter_x86/main.cpp b/tools/lifter_x86/main.cpp
+index cc4778c..3bd98fa 100644
+--- a/tools/lifter_x86/main.cpp
++++ b/tools/lifter_x86/main.cpp
+@@ -205,7 +205,7 @@ int main(int argc, char** argv) {
+   std::set<uint64_t> done;
+   size_t from_code_ptrs = 0, from_data_ptrs = 0;
+   auto candidate = [&](const lifter::Module* m, uint64_t t, size_t* counter) {
+-    if (p.TextOf(t) != m || p.entries.count(t)) return;
++    if (p.TextOf(t) != m || p.entries.count(t) || p.noentry.count(t)) return;
+     lifter::Insn in;
+     if (!dec.Decode(p, t, &in)) return;
+     p.entries.insert(t);
+diff --git a/tools/lifter_x86/program.cpp b/tools/lifter_x86/program.cpp
+index 0bd1b03..5e08f43 100644
+--- a/tools/lifter_x86/program.cpp
++++ b/tools/lifter_x86/program.cpp
+@@ -87,7 +87,7 @@ bool Program::Load(const std::string& path, const std::string& symdir,
+   // Symbol files hold VAs at the preferred base; a moved module's are
+   // shifted by the same delta as its relocations.
+   const uint64_t delta = m.base - m.preferred_base;
+-  auto in_text = [&](uint64_t va) { return va >= m.text_lo && va < m.text_hi; };
++  auto in_text = [&](uint64_t va) { return m.HasCode(va); };
+ 
+   // Ghidra's function list: entry, min, max, chunks, thunk, noreturn,
+   // callconv, name.
+@@ -156,6 +156,8 @@ bool Program::LoadManifest(const std::string& path, std::string* err) {
+     } else if (kind == "probe") {
+       entries.insert(va);
+       probes[va] = name.empty() ? "probe" : name;
++    } else if (kind == "noentry") {
++      noentry.insert(va);
+     } else if (kind == "replace") {
+       entries.insert(va);
+       replaced.insert(va);
+diff --git a/tools/lifter_x86/program.h b/tools/lifter_x86/program.h
+index 5bfaca4..cc9d581 100644
+--- a/tools/lifter_x86/program.h
++++ b/tools/lifter_x86/program.h
+@@ -21,6 +21,22 @@ struct Module {
+   // Where it is mapped, and the base its symbol files and manifest use.
+   uint64_t base = 0, preferred_base = 0;
+   uint64_t text_lo = 0, text_hi = 0;  // [lo, hi) of .text
++  // Executable sections besides .text, as [lo, hi) ranges: code that a
++  // protector's unwrapper moved out of .text into a section of its own.
++  std::vector<std::pair<uint64_t, uint64_t>> extra_text;
++  // True if va is in .text or one of the extra executable ranges.
++  bool HasCode(uint64_t va) const {
++    if (va >= text_lo && va < text_hi) return true;
++    for (const auto& [lo, hi] : extra_text)
++      if (va >= lo && va < hi) return true;
++    return false;
++  }
++  // The end of the executable range holding va (HasCode(va) must hold).
++  uint64_t CodeEnd(uint64_t va) const {
++    for (const auto& [lo, hi] : extra_text)
++      if (va >= lo && va < hi) return hi;
++    return text_hi;
++  }
+   // Initialised data scanned for code pointers, as [lo, hi) ranges.
+   std::vector<std::pair<uint64_t, uint64_t>> data;
+   // Read-only data outside .text that may hold switch tables (an ELF's
+@@ -67,6 +83,10 @@ struct Program {
+   // at all, and splitting a loop at one turned every iteration into a
+   // nested host call (a "freeze" that was really deepening recursion).
+   std::set<uint64_t> weak;
++  // manifest `noentry`: values the pointer scans must not take as code
++  // addresses (constants such as colours or flags that happen to point
++  // into code; each one would lift the rest of a function again).
++  std::set<uint64_t> noentry;
+ 
+   // True if control reaching t from another function leaves that function
+   // (a tail call) rather than continuing inline.
+@@ -104,15 +124,16 @@ struct Program {
+   // resume/replace/setjmp lines, VAs at its preferred base).
+   bool LoadManifest(const std::string& path, std::string* err);
+ 
+-  // The module whose .text contains va, or null.
++  // The module whose code (.text or an extra executable section)
++  // contains va, or null.
+   const Module* TextOf(uint64_t va) const {
+     for (const auto& m : modules)
+-      if (va >= m.text_lo && va < m.text_hi) return &m;
++      if (m.HasCode(va)) return &m;
+     return nullptr;
+   }
+   bool InText(uint64_t va) const { return TextOf(va) != nullptr; }
+   const uint8_t* Bytes(uint64_t va) const { return mem.ptr<uint8_t>(va); }
+-  size_t BytesLeft(uint64_t va) const { return TextOf(va)->text_hi - va; }
++  size_t BytesLeft(uint64_t va) const { return TextOf(va)->CodeEnd(va) - va; }
+ };
+ 
+ }  // namespace lifter
