@@ -250,3 +250,10 @@ Each line is the fatal stop after the previous fix. `tools/boot.sh`.
 - Now: `DirectSoundCreate8` → `audio: 48000 Hz stereo on SDL driver 'coreaudio'`.
 - Dev aid: `GH3_AUDIO_DUMP=file.wav` (mixer tap, float32 stereo 48 kHz). A 37 s boot dump has the logo-movie sounds (2-10 s) and sustained menu music (25 s on); nothing is silent where sound is expected. By-ear check pending.
 - `GH3_TRACE=1` (+ `GH3_TRACE_FILTER=dsound`) logs import calls (wired in `recomp/src/main.cpp`).
+
+## Window, resolution, focus (observed)
+
+- SwARc sizes the game window in pixels, so GH3's default 1024x768 was a 512x384-point window on a Retina display (desktop 3024x1964 px).
+- `recomp/src/awl.cpp`: `Video.Width/Height` default to the largest 16:9 display mode within 85% of the desktop: **2560x1440** here (a 1280x720-point window, sharp on Retina). `GH3_RESOLUTION=WxH` overrides it; a value saved in AspyrConfig.ini wins. fps at 2560x1440: median 116, p10 77.
+- Focus: a bare binary started from a terminal never becomes the active app on macOS (window opens behind, keyboard stays with the terminal). `tools/play.sh` now builds `work/GH3.app` (binary symlinked in; the rpaths are absolute) and launches it with `open -W -n --stdout/--stderr`, so it comes up frontmost with keyboard focus. Verified: frontmost process is `gh3` after launch.
+- `GH3_FULLSCREEN=desktop` (SwARc) gives borderless fullscreen; `play.sh` passes it and the other GH3_* options through `open --env`.

@@ -10,6 +10,10 @@
 //   "Sound.SongSkew", ...) whose getters return the caller's default for
 //   missing keys. AWL keeps it in AspyrConfig.xml; here it is
 //   <data dir>/AspyrConfig.ini, one `key=value` per line.
+// - Video.Width/Height default to the largest 16:9 display mode within 85%
+//   of the desktop (the game's own default, 1024x768, is a tiny window on
+//   a high-density display: SwARc sizes windows in pixels). GH3_RESOLUTION
+//   =WxH overrides it; a value saved in the config file wins over both.
 // - DefWindowProcA tracks activation for IsActive and forwards to user32.
 // - GetConfigNumber returns a double in ST0 (cdecl), so it pushes onto the
 //   guest's x87 stack.
@@ -24,6 +28,7 @@
 
 #include "win32/hle.h"
 #include "win32/process.h"
+#include "win32/user32_window.h"
 #include "win32/win32.h"
 #include "x86/runtime.h"
 #include "x86/x87.h"
@@ -66,7 +71,31 @@ void SaveConfig() {
   for (const auto& [k, v] : g_cfg) f << k << '=' << v << '\n';
 }
 
+// The default render size (see the top of the file).
+ModeSize DefaultResolution() {
+  static const ModeSize size = [] {
+    int w = 0, h = 0;
+    if (const char* e = Env("RESOLUTION"); e && std::sscanf(e, "%dx%d", &w, &h) == 2 &&
+                                          w > 0 && h > 0)
+      return ModeSize{w, h};
+    std::vector<ModeSize> modes = DisplayModeSizes();
+    ModeSize desktop{1024, 768}, best{1024, 768};
+    for (const ModeSize& m : modes)
+      if (int64_t(m.w) * m.h > int64_t(desktop.w) * desktop.h) desktop = m;
+    for (const ModeSize& m : modes)
+      if (m.w * 9 == m.h * 16 && m.w * 100 <= desktop.w * 85 && m.h * 100 <= desktop.h * 85 &&
+          m.w > best.w)
+        best = m;
+    return best;
+  }();
+  return size;
+}
+
 double GetNumber(const std::string& key, double def) {
+  if (key == "Video.Width" || key == "Video.Height") {
+    const ModeSize r = DefaultResolution();
+    def = key == "Video.Width" ? r.w : r.h;
+  }
   std::lock_guard<std::mutex> l(g_cfg_mu);
   LoadConfig();
   auto it = g_cfg.find(key);
