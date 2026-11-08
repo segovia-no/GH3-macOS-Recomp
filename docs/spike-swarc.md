@@ -275,3 +275,12 @@ Gameplay fps (between profiler windows; macOS `sample` pauses the game, so the 5
   - 19%: game logic under 0x4A2E70/0x65C770 (diffuse).
   - 16%: render submission (0x5FA040 → D3D9 HLE draws and render-target binds).
 - FMOD's mixer thread uses ~75% of another core (C mixing paths forced by the CPU-probe replacements). It's off the critical path but could later get its own SSE path once the lifter has MMX, or a native mixer.
+
+## Native skinning (observed)
+
+- `recomp/src/skinning.cpp` replaces 0x61c590 (`replace 0061c590`): 1/2/3-bone vertex groups, positions transformed, normal/tangent/binormal transformed and renormalised (RSQRTPS through SwARc's model), AoS output (p n t b) with MOVNTPS-aligned stores, running min/max, vertex count in eax. Compiled with `-ffp-contract=off -fno-fast-math`.
+- Operation order transcribed from the disassembly. The decompiler keeps float grouping inside a row but printed the 3-bone sum flat; the original is `C*wC + (A*wA + B*wB)`.
+- Verification: `GH3_VERIFY_SKIN=1` runs native into a host buffer and the lifted body (`f_0061C590_lifted`) for real, then compares every output float, min/max and eax.
+  - First run: 1/2-bone paths identical; 3-bone vertices off by 1 ulp (wrong grouping). Fixed in 97232fa.
+  - Second run: **131,072 calls, 0 mismatches** in gameplay.
+- MXCSR: sets PE, as the original does; flags that only denormal or non-finite data could raise are not modelled.
