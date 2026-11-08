@@ -1712,6 +1712,44 @@ index 3e3ae1f..15c55cf 100644
 +}
 +
  }  // namespace recomp::hle
+diff --git a/platforms/win32/src/win32/xinput.cpp b/platforms/win32/src/win32/xinput.cpp
+index 745e070..f88dd4e 100644
+--- a/platforms/win32/src/win32/xinput.cpp
++++ b/platforms/win32/src/win32/xinput.cpp
+@@ -32,6 +32,7 @@ struct Pad {
+ 
+ std::mutex g_mu;
+ bool g_up = false;
++bool g_enabled = true;  // XInputEnable
+ Pad g_pads[4];
+ 
+ // Opens newly connected gamepads into free slots, frees disconnected ones.
+@@ -115,8 +116,8 @@ HLE_NAMED("xinput1_3.dll", "#2", XInputGetState, 2) {
+   Pad* p = PadAt(Arg(c, 0));
+   if (!p) return ERROR_DEVICE_NOT_CONNECTED;
+   if (!Arg(c, 1)) return ERROR_BAD_ARGUMENTS;
+-  uint8_t g[12];
+-  ReadGamepad(p->gp, g);
++  uint8_t g[12] = {};
++  if (g_enabled) ReadGamepad(p->gp, g);
+   if (std::memcmp(g, p->last, sizeof g) != 0) {
+     std::memcpy(p->last, g, sizeof g);
+     p->packet++;
+@@ -126,6 +127,14 @@ HLE_NAMED("xinput1_3.dll", "#2", XInputGetState, 2) {
+   return ERROR_SUCCESS;
+ }
+ 
++// XInputEnable(enable): games call it with FALSE when they lose focus.
++// While disabled, pads stay connected but report a neutral state.
++HLE_NAMED("xinput1_3.dll", "#5", XInputEnable, 1) {
++  std::lock_guard<std::mutex> l(g_mu);
++  g_enabled = Arg(c, 0) != 0;
++  return 0;
++}
++
+ // XInputSetState(dwUserIndex, pVibration): XINPUT_VIBRATION
+ // {wLeftMotorSpeed, wRightMotorSpeed}; held until changed.
+ HLE_NAMED("xinput1_3.dll", "#3", XInputSetState, 2) {
 diff --git a/src/runtime/gfx/format.cpp b/src/runtime/gfx/format.cpp
 index 28cc240..1937f28 100644
 --- a/src/runtime/gfx/format.cpp
