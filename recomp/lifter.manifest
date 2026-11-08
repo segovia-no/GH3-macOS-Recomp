@@ -12,6 +12,10 @@ replace 00897d40 gh3plus_load_core_dll
 # tools/find_false_entries.py cannot see them).
 noentry 007fffff
 
+# CPU skinning of character meshes: native (recomp/src/skinning.cpp); the
+# lifted body stays as f_0061C590_lifted (GH3_VERIFY_SKIN=1 compares them).
+replace 0061c590 skin_vertices
+
 # 1257 generated names (18 relocated bodies)
 entry 00402370 qbMalloc  # gh3plus
 entry 004023e0 qbFree  # gh3plus

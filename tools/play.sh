@@ -31,7 +31,7 @@ if [ -n "$GH3_PROFILE" ]; then
   rm -rf prof && mkdir -p prof
 fi
 env_args=""
-for v in GH3_RESOLUTION GH3_FULLSCREEN GH3_FPS_REPORT GH3_TRACE GH3_TRACE_FILTER GH3_AUDIO_DUMP; do
+for v in GH3_RESOLUTION GH3_FULLSCREEN GH3_FPS_REPORT GH3_TRACE GH3_TRACE_FILTER GH3_AUDIO_DUMP GH3_VERIFY_SKIN; do
   eval val=\${$v}
   [ -n "$val" ] && env_args="$env_args --env $v=$val"
 done

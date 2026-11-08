@@ -18,6 +18,10 @@ recomp_add_lifted(gh3_lifted "${GH3_GENERATED_DIR}")
 # runs at PC=24, where the host-double path is never taken, and without it
 # clang builds even the Havok solver's 12k-instruction functions at -O2
 # (~8 min each instead of not finishing).
-add_executable(gh3 src/main.cpp src/awl.cpp src/plugins.cpp src/fmod_cpu.cpp src/stubs.cpp $<TARGET_OBJECTS:gh3_lifted>)
+add_executable(gh3 src/main.cpp src/awl.cpp src/plugins.cpp src/fmod_cpu.cpp src/stubs.cpp src/skinning.cpp $<TARGET_OBJECTS:gh3_lifted>)
 target_compile_features(gh3 PRIVATE cxx_std_20)
 target_link_libraries(gh3 PRIVATE recomp_win32 recomp_d3d9 recomp_dinput8 recomp_xinput recomp_bink recomp_dsound)
+
+# Native replacements of lifted float code must round exactly like it:
+# no FMA contraction, no fast-math (recomp/src/skinning.cpp).
+set_source_files_properties(src/skinning.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-fast-math")
