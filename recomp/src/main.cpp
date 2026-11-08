@@ -16,6 +16,12 @@ int main(int argc, char** argv) {
   const std::string game_dir = argv[1];
   // GH3_TRACE=1: log every import call (GH3_TRACE_FILTER narrows it).
   recomp::g_trace = std::getenv("GH3_TRACE") != nullptr;
+  // The song clock follows FMOD's stream position, which runs ahead of what
+  // is heard by the host's output buffering: SDL's default device buffer
+  // (1024 frames at 44.1/48 kHz, double-buffered on CoreAudio) puts the
+  // audio ~50 ms behind the notes. 256 frames keeps it to a few ms. An
+  // SDL_AUDIO_DEVICE_SAMPLE_FRAMES already in the environment wins.
+  setenv("SDL_AUDIO_DEVICE_SAMPLE_FRAMES", "256", 0);
   const std::string exe = argc > 2 ? argv[2] : game_dir + "/GH3.exe";
 
   recomp::win32::GameConfig game;

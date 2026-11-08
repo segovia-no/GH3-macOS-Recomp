@@ -250,6 +250,15 @@ Each line is the fatal stop after the previous fix. `tools/boot.sh`.
 - Now: `DirectSoundCreate8` → `audio: 48000 Hz stereo on SDL driver 'coreaudio'`.
 - Dev aid: `GH3_AUDIO_DUMP=file.wav` (mixer tap, float32 stereo 48 kHz). A 37 s boot dump has the logo-movie sounds (2-10 s) and sustained menu music (25 s on); nothing is silent where sound is expected. By-ear check pending.
 - `GH3_TRACE=1` (+ `GH3_TRACE_FILTER=dsound`) logs import calls (wired in `recomp/src/main.cpp`).
+- By ear (user session): music, hit and miss sounds play correctly.
+
+### Audio lag (observed, user session)
+
+- Symptom: notes and input were in sync with each other, but the music was heard late.
+- Song clock: `ResetSongTimer`/`IncrementSongTimer` (0x53ba80/0x53bac0) keep the timer at 0xc489e0. 0x42ec92 corrects it from the music stream's position (0x497310, in ms) plus the stock song skew at 0xa12f78. So the game follows FMOD's stream position. That position is ahead of what is heard by the host's output buffering: SDL's default device buffer is 1024 frames, double-buffered on CoreAudio, about 50 ms (estimate).
+- Fix: `recomp/src/main.cpp` sets `SDL_AUDIO_DEVICE_SAMPLE_FRAMES=256` unless the environment already sets it. User: in sync at 0 ms offsets, no crackle.
+- Calibration (pure QB script, works as on Windows): BetterGH3 forces the stock skew to 0 (`qb/patch/globaltags.q:100`, `WinPortSetSongSkew value = 0`). Its own offsets `lag_audio`/`lag_video` (`qb/patch/winport/menu_calibrate_lag.q`, range ±1000 ms) are applied only at song start (`qb/patch/winport/apply_new_calibration.q:439`): gem_offset -= lag_audio, gem_offset += lag_video, input_offset -= lag_audio. The music itself never moves. Changes need a song restart.
+- Not done: subtracting the remaining output latency from the DirectSound play cursor. FMOD refills its ring from that cursor, so a lagging report could make the mixer read blocks FMOD has not refilled yet.
 
 ## Window, resolution, focus (observed)
 
