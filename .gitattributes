@@ -1,0 +1,5 @@
+# Shell scripts and patches: LF everywhere (a CRLF patch does not apply).
+*.sh text eol=lf
+*.patch text eol=lf
+*.manifest text eol=lf
+*.tsv text eol=lf

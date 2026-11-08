@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Troubleshooting guide
+    url: https://github.com/segovia-no/GH3-macOS-Recomp/blob/main/docs/guides/troubleshooting.md
+    about: Logs, crash reports, controllers, audio lag, resetting settings — worth a look before opening an issue.

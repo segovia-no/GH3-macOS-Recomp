@@ -1,0 +1,36 @@
+name: Bug report
+description: Something does not work or looks wrong in the game
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "The commit you built (`git rev-parse --short HEAD`), also shown as the app's version in Finder → Get Info."
+      placeholder: 87b815a
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Mac and macOS version
+      placeholder: MacBook Pro M3, macOS 26.1
+    validations:
+      required: true
+  - type: dropdown
+    id: input
+    attributes:
+      label: Controller
+      options:
+        - Keyboard / mouse
+        - Xbox 360 wireless receiver (guitar)
+        - Xbox 360 wireless receiver (gamepad)
+        - Other gamepad (SDL)
+        - Other
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: "What you saw and how to get there. For crashes, attach the log (`~/Library/Logs/Guitar Hero III.log`) and the newest report in `~/Library/Application Support/gh3/crashes/` (see the troubleshooting guide). Never attach game files."
+    validations:
+      required: true

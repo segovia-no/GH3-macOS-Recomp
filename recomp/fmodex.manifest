@@ -1,8 +1,0 @@
-# SwARc lifter manifest for fmodex.dll (FMOD Ex, as shipped with GH3,
-# UPX-unpacked: upx -d). Its CPU probes are replaced so FMOD takes its
-# plain C mixing paths: the lifter has no MMX, nor movntps/rcpps/cvtpi2ps,
-# which only FMOD's MMX/SSE/3DNow! routines use (recomp/src/fmod_cpu.cpp).
-
-replace 10029740 fmod_cpu_has_sse
-replace 1009b87e fmod_cpuid_features
-replace 1009b89a fmod_cpuid_ext_features

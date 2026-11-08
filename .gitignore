@@ -1,5 +1,37 @@
-ref/
-work/
-# Game install (copyrighted, 5.4 GB): never commit.
-Guitar Hero III/
+# Game files (copyrighted): never commit. The game folder sits next to the
+# repository's files by default, and its contents must not end up anywhere
+# in the tree under another name.
+/Guitar Hero III/
+*.exe
+*.EXE
+*.dll
+*.DLL
+*.pak.xen
+*.pab.xen
+*.fsb.xen
+*.bik
+*.bik.xen
+*.qb.xen
+*.xen
+
+# Everything made from the game: binaries, lifted C++, Ghidra projects,
+# symbol exports, the game folder links, the app bundle.
+/build/
+*.app/
+
+# SwARc checkout (fetched and patched by scripts/setup/fetch_swarc.sh) and
+# optional reference clones used while researching (docs/notes).
+/third_party/
+/ref/
+
+# Old local layout (before build/).
+/work/
+
+# Local tool and editor state
 .DS_Store
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+.idea/
+.claude/
