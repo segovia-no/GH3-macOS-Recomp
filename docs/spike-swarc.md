@@ -302,3 +302,13 @@ Gameplay fps (between profiler windows; macOS `sample` pauses the game, so the 5
 - User's clone receiver enumerates as 045e:0291 with 4 slots. Its GH guitar announced `... 51 87 ff ff ff`: subtype 7 (guitar alternate), with the force-feedback bit set. Pairing, menus and songs all worked.
 - `GH3_X360RX_TRACE=1` logs every packet; `tools/play.sh` passes it through. A guitar streams about 1 report per frame while held (52k packets in one session), so the trace is for debugging only.
 - Needs libusb at build time (`brew install libusb`). Without it the receiver code compiles to stubs.
+
+## App bundle (observed)
+
+- `tools/make_app.sh` builds `work/Guitar Hero III.app` (169 MB) from the current build:
+  - `gh3`, plus 38 dylibs in `Contents/Frameworks`: SwARc's 15 libraries, plus SDL3, ffmpeg and its codec deps, libusb, SPIRV and others from Homebrew. `tools/bundle_dylibs.py` walks `otool -L`, resolves @rpath/@loader_path, rewrites every reference to `@rpath/<name>`, and leaves one rpath, `@executable_path/../Frameworks`. A check finds no reference outside the bundle except /usr/lib and /System.
+  - An icon from GH3.exe. `tools/exe_icon.py` takes the largest RT_ICON, which is only 48×48, so the big Finder sizes are upscaled.
+  - An ad hoc signature; `codesign --verify --strict` passes.
+- Game folder: symlinks that point out of a bundle fail strict verification ("invalid destination for symbolic link in bundle"). So the default build puts a folder of links at `~/Library/Application Support/gh3/game`: links to `Guitar Hero III/`, plus real copies of work/gamedir's runtime files (lifted msvcr80/msvcp80, the unpacked fmodex.dll). `--embed-game` instead APFS-clones the game into `Contents/Resources/game`, which makes the app standalone.
+- `gh3` with no arguments uses the bundle's `Resources/game`, or failing that `~/Library/Application Support/gh3/game`, and writes stdout/stderr to `~/Library/Logs/Guitar Hero III.log`. Passing arguments works as before (`play.sh`).
+- Smoke test: the bundled binary, run with no arguments and `GH3_BACKGROUND=1`, booted to audio and the intro movies in 20 s.
