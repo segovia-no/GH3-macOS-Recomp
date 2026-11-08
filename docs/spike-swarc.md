@@ -294,3 +294,11 @@ Gameplay fps (between profiler windows; macOS `sample` pauses the game, so the 5
   - First run: 1/2-bone paths identical; 3-bone vertices off by 1 ulp (wrong grouping). Fixed in 97232fa.
   - Second run: **131,072 calls, 0 mismatches** in gameplay.
 - MXCSR: sets PE, as the original does; flags that only denormal or non-finite data could raise are not modelled.
+
+## Xbox 360 wireless receiver (observed, user session)
+
+- macOS has no driver for the receiver: it is a vendor-class USB device, not HID, so SDL never sees it. The community driver x360w (github.com/zeromiyi/x360w) was reviewed. Its code is clean, but its virtual gamepad needs `amfi_get_out_of_my_way=1`, which turns off AMFI's entitlement enforcement for the whole system. Not used.
+- Instead, SwARc's XInput layer reads the receiver itself over libusb (`platforms/win32/src/win32/xbox360_receiver.cpp`). An unclaimed vendor interface needs no entitlement and no root. It finds receivers by interface (FF/5D/81 with interrupt IN/OUT), not by id. A supervisor thread rescans every 2 s and sends LED and rumble commands; there is one reader thread per slot. Connected slots take XInput user indices next to SDL's pads. The input report from byte 6 is XINPUT_GAMEPAD verbatim, with guide masked. The subtype comes from the announcement packet, byte 25 & 0x7f.
+- User's clone receiver enumerates as 045e:0291 with 4 slots. Its GH guitar announced `... 51 87 ff ff ff`: subtype 7 (guitar alternate), with the force-feedback bit set. Pairing, menus and songs all worked.
+- `GH3_X360RX_TRACE=1` logs every packet; `tools/play.sh` passes it through. A guitar streams about 1 report per frame while held (52k packets in one session), so the trace is for debugging only.
+- Needs libusb at build time (`brew install libusb`). Without it the receiver code compiles to stubs.

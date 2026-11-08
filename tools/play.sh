@@ -5,6 +5,7 @@
 # macOS, so its window opens behind and the keyboard stays with the terminal.
 # Log: work/play.log. Settings: ~/Library/Application Support/gh3/AspyrConfig.ini
 # Options (environment): GH3_RESOLUTION=WxH, GH3_FULLSCREEN=window|desktop|exclusive
+# GH3_X360RX_TRACE=1: log every packet from an Xbox 360 wireless receiver.
 # GH3_PROFILE=1: fps once a second in the log, and a 5 s CPU sample of the
 # game every 15 s into work/prof/ (macOS `sample`), to find slow spots.
 cd "$(dirname "$0")/../work" || exit 1
@@ -31,7 +32,7 @@ if [ -n "$GH3_PROFILE" ]; then
   rm -rf prof && mkdir -p prof
 fi
 env_args=""
-for v in GH3_RESOLUTION GH3_FULLSCREEN GH3_FPS_REPORT GH3_TRACE GH3_TRACE_FILTER GH3_AUDIO_DUMP GH3_VERIFY_SKIN; do
+for v in GH3_RESOLUTION GH3_FULLSCREEN GH3_FPS_REPORT GH3_TRACE GH3_TRACE_FILTER GH3_AUDIO_DUMP GH3_VERIFY_SKIN GH3_X360RX_TRACE; do
   eval val=\${$v}
   [ -n "$val" ] && env_args="$env_args --env $v=$val"
 done

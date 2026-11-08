@@ -1,8 +1,29 @@
 diff --git a/platforms/win32/CMakeLists.txt b/platforms/win32/CMakeLists.txt
-index 98ce806..0179bf5 100644
+index 98ce806..77d6f6e 100644
 --- a/platforms/win32/CMakeLists.txt
 +++ b/platforms/win32/CMakeLists.txt
-@@ -88,6 +88,11 @@ target_link_libraries(recomp_d3d9 PUBLIC recomp_win32 recomp_gfx recomp_hlsl)
+@@ -70,10 +70,18 @@ add_library(recomp_d3d7 SHARED
+ target_link_libraries(recomp_d3d7 PUBLIC recomp_win32 recomp_gfx)
+ 
+ # XInput 1.3 on SDL gamepads, and the WMI that tells games which
+-# DirectInput game controllers are XInput pads.
++# DirectInput game controllers are XInput pads. With libusb, controllers
++# on an Xbox 360 wireless receiver the host has no driver for too.
+ add_library(recomp_xinput SHARED src/win32/xinput.cpp
+-            src/win32/wbem.cpp)
++            src/win32/xbox360_receiver.cpp src/win32/wbem.cpp)
+ target_link_libraries(recomp_xinput PUBLIC recomp_win32)
++pkg_check_modules(LIBUSB IMPORTED_TARGET libusb-1.0)
++if(LIBUSB_FOUND)
++  target_link_libraries(recomp_xinput PRIVATE PkgConfig::LIBUSB)
++  target_compile_definitions(recomp_xinput PRIVATE RECOMP_X360_RECEIVER)
++else()
++  message(STATUS "libusb-1.0 not found: no Xbox 360 wireless receiver support")
++endif()
+ 
+ # DirectInput 8 (keyboard and mouse) on the event pump's raw input; it
+ # lists the XInput pads as game controllers.
+@@ -88,6 +96,11 @@ target_link_libraries(recomp_d3d9 PUBLIC recomp_win32 recomp_gfx recomp_hlsl)
  # D3DX's maths rounds like the original only without contraction into FMA.
  set_source_files_properties(src/win32/d3dx9.cpp TARGET_DIRECTORY recomp_d3d9
    PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
@@ -2010,30 +2031,486 @@ index 3e3ae1f..96b403f 100644
 +}
 +
  }  // namespace recomp::hle
+diff --git a/platforms/win32/src/win32/xbox360_receiver.cpp b/platforms/win32/src/win32/xbox360_receiver.cpp
+new file mode 100644
+index 0000000..a0218fb
+--- /dev/null
++++ b/platforms/win32/src/win32/xbox360_receiver.cpp
+@@ -0,0 +1,325 @@
++// The Xbox 360 Wireless Receiver for Windows over libusb (see the header).
++//
++// The receiver is a vendor-class USB device (no HID), so a host without a
++// driver for it leaves it unclaimed and a user process may claim it. It is
++// found by its interfaces rather than its ids, so clones with other
++// product ids work: one interface per controller slot with class FF,
++// subclass 5D, protocol 81 and an interrupt IN/OUT endpoint pair (protocol
++// 82 is the headset's). Packets on a slot (as the Linux and SDL drivers
++// read them):
++// - 08 xx: presence; bit 7 of xx = controller connected (bit 6 = headset).
++// - 00 0F 00 F0 ..., 29 bytes: the controller's announcement; byte 25 bits
++//   0-6 are its XInput subtype (1 gamepad, 6/7/0B guitar, 8 drums...).
++// - 00 x1 .. .. 00 13 <XINPUT_GAMEPAD>, 29 bytes (bit 0 of byte 1 set):
++//   an input report; from byte 6, wButtons, the triggers and the sticks
++//   exactly as XInput reports them (stick Y up). XInputGetState leaves out
++//   the guide button (0x0400), so it is cleared here.
++// Commands are 12 bytes on the slot's OUT endpoint: 08 00 0F C0 asks for
++// the presence packets, 00 00 08 4m sets the ring light (m = 6 + quadrant,
++// 0 = off), 00 01 0F C0 00 LL SS the motors.
++// One thread per slot reads; a supervisor thread opens the receiver
++// (rescanning every 2 s while there is none), sends the queued commands and
++// closes it when a read fails (unplugged). <ID>_X360RX_TRACE=1 logs every
++// packet.
++
++#include "win32/xbox360_receiver.h"
++
++#ifdef RECOMP_X360_RECEIVER
++
++#include <libusb.h>
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstring>
++#include <deque>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++#include "runtime/log.h"
++#include "x86/runtime.h"
++
++namespace recomp::hle::x360rx {
++namespace {
++
++using Command = std::array<uint8_t, 12>;
++
++struct Slot {
++  int iface = -1;
++  uint8_t ep_in = 0, ep_out = 0;
++  bool connected = false;
++  SlotState state;
++  int rumble = -1;  // last sent (large << 8 | small), -1 none
++  int led = -2;     // last sent player, -2 none
++};
++
++struct Receiver {
++  std::mutex mu;  // everything below
++  std::condition_variable cv;
++  libusb_context* ctx = nullptr;
++  libusb_device_handle* dev = nullptr;
++  Slot slots[kSlots];
++  int nslots = 0;
++  std::deque<std::pair<int, Command>> out;
++  std::vector<std::thread> readers;
++  std::atomic<bool> lost{false};  // a read failed: close the receiver
++  bool trace = false;
++};
++
++// Never destroyed: its threads run until the process exits.
++Receiver& R() {
++  static Receiver* r = new Receiver;
++  return *r;
++}
++
++void Queue(Receiver& r, int slot, const Command& cmd) {
++  r.out.push_back({slot, cmd});
++  r.cv.notify_one();
++}
++
++void Handle(Receiver& r, int i, const uint8_t* d, int n) {
++  if (r.trace) {
++    char hex[3 * 32 + 1] = {};
++    for (int k = 0; k < n && k < 32; k++) std::snprintf(hex + 3 * k, 4, " %02x", d[k]);
++    WarnF("x360rx: slot %d:%s\n", i + 1, hex);
++  }
++  std::lock_guard<std::mutex> l(r.mu);
++  Slot& s = r.slots[i];
++  if (n == 2 && d[0] == 0x08) {
++    const bool present = (d[1] & 0x80) != 0;
++    if (present == s.connected) return;
++    s.connected = present;
++    s.state = SlotState{};
++    s.rumble = -1;
++    s.led = -2;
++    WarnF("x360rx: slot %d %s\n", i + 1, present ? "connected" : "disconnected");
++  } else if (n >= 26 && d[0] == 0x00 && d[1] == 0x0F && d[2] == 0x00 && d[3] == 0xF0) {
++    s.state.subtype = d[25] & 0x7F;
++    if (!s.state.subtype) s.state.subtype = 1;
++    WarnF("x360rx: slot %d controller subtype %u\n", i + 1, s.state.subtype);
++  } else if (n >= 18 && d[0] == 0x00 && (d[1] & 0x01) && d[4] == 0x00) {
++    if (!s.connected) {  // reports prove presence (a missed presence packet)
++      s.connected = true;
++      WarnF("x360rx: slot %d connected\n", i + 1);
++    }
++    std::memcpy(s.state.gamepad, d + 6, 12);
++    s.state.gamepad[1] &= ~0x04;  // guide
++  }
++}
++
++void ReadSlot(int i) {
++  Receiver& r = R();
++  libusb_device_handle* dev;
++  uint8_t ep;
++  {
++    std::lock_guard<std::mutex> l(r.mu);
++    dev = r.dev;
++    ep = r.slots[i].ep_in;
++  }
++  uint8_t buf[32];
++  while (!r.lost) {
++    int n = 0;
++    int rc = libusb_interrupt_transfer(dev, ep, buf, sizeof buf, &n, 250);
++    if (rc == LIBUSB_ERROR_TIMEOUT) continue;
++    if (rc != 0) {
++      WarnF("x360rx: receiver read failed (%s): closing it\n", libusb_error_name(rc));
++      std::lock_guard<std::mutex> l(r.mu);
++      r.lost = true;
++      r.cv.notify_one();
++      break;
++    }
++    Handle(r, i, buf, n);
++  }
++}
++
++// The slot interfaces of `d` (FF/5D/81 with an interrupt IN and OUT).
++int FindSlots(libusb_device* d, Slot* slots) {
++  libusb_config_descriptor* cfg = nullptr;
++  if (libusb_get_active_config_descriptor(d, &cfg) != 0 &&
++      libusb_get_config_descriptor(d, 0, &cfg) != 0)
++    return 0;
++  int n = 0;
++  for (int i = 0; i < cfg->bNumInterfaces && n < kSlots; i++) {
++    const libusb_interface& itf = cfg->interface[i];
++    if (itf.num_altsetting < 1) continue;
++    const libusb_interface_descriptor& alt = itf.altsetting[0];
++    if (alt.bInterfaceClass != 0xFF || alt.bInterfaceSubClass != 0x5D ||
++        alt.bInterfaceProtocol != 0x81)
++      continue;
++    Slot s;
++    s.iface = alt.bInterfaceNumber;
++    for (int e = 0; e < alt.bNumEndpoints; e++) {
++      const libusb_endpoint_descriptor& ep = alt.endpoint[e];
++      if ((ep.bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) != LIBUSB_TRANSFER_TYPE_INTERRUPT)
++        continue;
++      if (ep.bEndpointAddress & LIBUSB_ENDPOINT_IN)
++        s.ep_in = ep.bEndpointAddress;
++      else
++        s.ep_out = ep.bEndpointAddress;
++    }
++    if (s.ep_in && s.ep_out) slots[n++] = s;
++  }
++  libusb_free_config_descriptor(cfg);
++  return n;
++}
++
++// Opens the first receiver plugged in; true if one is open.
++bool Open(Receiver& r) {
++  static bool warned_busy = false;
++  libusb_device** list = nullptr;
++  ssize_t count = libusb_get_device_list(r.ctx, &list);
++  bool opened = false;
++  for (ssize_t k = 0; k < count && !opened; k++) {
++    Slot slots[kSlots];
++    int n = FindSlots(list[k], slots);
++    if (!n) continue;
++    libusb_device_descriptor dd{};
++    libusb_get_device_descriptor(list[k], &dd);
++    libusb_device_handle* h = nullptr;
++    if (int rc = libusb_open(list[k], &h); rc != 0) {
++      WarnF("x360rx: cannot open receiver %04x:%04x: %s\n", dd.idVendor, dd.idProduct,
++            libusb_error_name(rc));
++      continue;
++    }
++    int config = 0;
++    if (libusb_get_configuration(h, &config) == 0 && config == 0)
++      libusb_set_configuration(h, 1);  // left unconfigured with no driver
++    int claimed = 0;
++    for (; claimed < n; claimed++) {
++      int rc = libusb_claim_interface(h, slots[claimed].iface);
++      if (rc == 0) continue;
++      if (!warned_busy) {
++        WarnF("x360rx: receiver %04x:%04x is in use by another program (%s; Steam "
++              "takes it while running): retrying\n",
++              dd.idVendor, dd.idProduct, libusb_error_name(rc));
++        warned_busy = true;
++      }
++      break;
++    }
++    if (claimed < n) {
++      for (int i = 0; i < claimed; i++) libusb_release_interface(h, slots[i].iface);
++      libusb_close(h);
++      continue;
++    }
++    WarnF("x360rx: receiver %04x:%04x, %d controller slots\n", dd.idVendor, dd.idProduct, n);
++    warned_busy = false;
++    std::lock_guard<std::mutex> l(r.mu);
++    r.dev = h;
++    r.nslots = n;
++    for (int i = 0; i < kSlots; i++) r.slots[i] = i < n ? slots[i] : Slot{};
++    r.lost = false;
++    for (int i = 0; i < n; i++) Queue(r, i, {0x08, 0x00, 0x0F, 0xC0});
++    for (int i = 0; i < n; i++) r.readers.emplace_back(ReadSlot, i);
++    opened = true;
++  }
++  libusb_free_device_list(list, 1);
++  return opened;
++}
++
++void Close(Receiver& r) {
++  std::vector<std::thread> readers;
++  {
++    std::lock_guard<std::mutex> l(r.mu);
++    r.lost = true;
++    readers.swap(r.readers);
++  }
++  for (std::thread& t : readers) t.join();
++  std::lock_guard<std::mutex> l(r.mu);
++  for (int i = 0; i < r.nslots; i++) libusb_release_interface(r.dev, r.slots[i].iface);
++  libusb_close(r.dev);
++  r.dev = nullptr;
++  r.nslots = 0;
++  for (Slot& s : r.slots) s = Slot{};
++  r.out.clear();
++}
++
++void Supervise() {
++  Receiver& r = R();
++  for (;;) {
++    if (!r.dev && !Open(r)) {
++      std::this_thread::sleep_for(std::chrono::seconds(2));
++      continue;
++    }
++    std::deque<std::pair<int, Command>> out;
++    {
++      std::unique_lock<std::mutex> l(r.mu);
++      r.cv.wait_for(l, std::chrono::seconds(1), [&] { return !r.out.empty() || r.lost; });
++      if (r.lost) {
++        l.unlock();
++        Close(r);
++        continue;
++      }
++      out.swap(r.out);
++    }
++    for (auto& [slot, cmd] : out) {
++      int sent = 0;
++      int rc = libusb_interrupt_transfer(r.dev, r.slots[slot].ep_out, cmd.data(),
++                                         int(cmd.size()), &sent, 100);
++      if (rc != 0 && r.trace)
++        WarnF("x360rx: slot %d command failed: %s\n", slot + 1, libusb_error_name(rc));
++    }
++  }
++}
++
++}  // namespace
++
++void Start() {
++  static std::once_flag once;
++  std::call_once(once, [] {
++    Receiver& r = R();
++    r.trace = Env("X360RX_TRACE") != nullptr;
++    if (int rc = libusb_init(&r.ctx); rc != 0) {
++      WarnF("x360rx: libusb init failed: %s\n", libusb_error_name(rc));
++      return;
++    }
++    std::thread(Supervise).detach();
++  });
++}
++
++bool Read(int slot, SlotState* out) {
++  if (slot < 0 || slot >= kSlots) return false;
++  Receiver& r = R();
++  std::lock_guard<std::mutex> l(r.mu);
++  const Slot& s = r.slots[slot];
++  if (!s.connected) return false;
++  if (out) *out = s.state;
++  return true;
++}
++
++void SetRumble(int slot, uint8_t large, uint8_t small) {
++  if (slot < 0 || slot >= kSlots) return;
++  Receiver& r = R();
++  std::lock_guard<std::mutex> l(r.mu);
++  Slot& s = r.slots[slot];
++  const int v = large << 8 | small;
++  if (!s.connected || s.rumble == v) return;
++  s.rumble = v;
++  Queue(r, slot, {0x00, 0x01, 0x0F, 0xC0, 0x00, large, small});
++}
++
++void SetLed(int slot, int player) {
++  if (slot < 0 || slot >= kSlots) return;
++  Receiver& r = R();
++  std::lock_guard<std::mutex> l(r.mu);
++  Slot& s = r.slots[slot];
++  if (!s.connected || s.led == player) return;
++  s.led = player;
++  const uint8_t mode = player >= 0 ? uint8_t(6 + (player & 3)) : 0;
++  Queue(r, slot, {0x00, 0x00, 0x08, uint8_t(0x40 + mode)});
++}
++
++}  // namespace recomp::hle::x360rx
++
++#else  // no libusb: no receiver
++
++namespace recomp::hle::x360rx {
++void Start() {}
++bool Read(int, SlotState*) { return false; }
++void SetRumble(int, uint8_t, uint8_t) {}
++void SetLed(int, int) {}
++}  // namespace recomp::hle::x360rx
++
++#endif
+diff --git a/platforms/win32/src/win32/xbox360_receiver.h b/platforms/win32/src/win32/xbox360_receiver.h
+new file mode 100644
+index 0000000..5165f82
+--- /dev/null
++++ b/platforms/win32/src/win32/xbox360_receiver.h
+@@ -0,0 +1,35 @@
++#pragma once
++// The Xbox 360 Wireless Receiver for Windows (and clones of it) read
++// directly over libusb (xbox360_receiver.cpp), for hosts with no driver for
++// it (macOS). Each of its four slots carries one wireless controller,
++// whose input reports are already XINPUT_GAMEPAD; xinput.cpp gives the
++// connected slots XInput user indices next to SDL's gamepads. Without
++// libusb at build time (RECOMP_X360_RECEIVER undefined) there are no
++// slots.
++
++#include <cstdint>
++
++namespace recomp::hle::x360rx {
++
++constexpr int kSlots = 4;
++
++struct SlotState {
++  uint8_t subtype = 1;     // XINPUT_DEVSUBTYPE_* from the controller's announcement
++  uint8_t gamepad[12]{};   // XINPUT_GAMEPAD
++};
++
++// Starts looking for a receiver (once; later calls do nothing). It is
++// opened when plugged in, and again after it is unplugged and replugged.
++void Start();
++
++// Slot `slot`'s controller; false if none is connected there.
++bool Read(int slot, SlotState* out);
++
++// Motor speeds (large, small; 0-255); sent when they change.
++void SetRumble(int slot, uint8_t large, uint8_t small);
++
++// Lights the ring quadrant for XInput user index `player` (0-3), or turns
++// the slot's light off (-1).
++void SetLed(int slot, int player);
++
++}  // namespace recomp::hle::x360rx
 diff --git a/platforms/win32/src/win32/xinput.cpp b/platforms/win32/src/win32/xinput.cpp
-index 745e070..f88dd4e 100644
+index 745e070..4055108 100644
 --- a/platforms/win32/src/win32/xinput.cpp
 +++ b/platforms/win32/src/win32/xinput.cpp
-@@ -32,6 +32,7 @@ struct Pad {
+@@ -5,7 +5,10 @@
+ // SDL. Automated runs (<ID>_BACKGROUND) see no pads, as they take no host
+ // input. The gamepad subsystem starts on the main thread, where SDL's
+ // events are pumped (callers on other threads see no pads until then).
+-// DirectInput and WMI list the same pads (xinput.h).
++// DirectInput and WMI list the same pads (xinput.h). Controllers on an
++// Xbox 360 wireless receiver the host has no driver for are read directly
++// (xbox360_receiver.h) and take user indices the same way, with their own
++// XInput subtype (guitars, drums...).
+ 
+ #include <SDL3/SDL.h>
+ 
+@@ -16,6 +19,7 @@
+ #include "runtime/log.h"
+ #include "win32/hle.h"
+ #include "win32/user32_window.h"
++#include "win32/xbox360_receiver.h"
+ #include "win32/xinput.h"
+ 
+ namespace recomp::hle {
+@@ -26,16 +30,47 @@ constexpr uint32_t ERROR_SUCCESS = 0, ERROR_BAD_ARGUMENTS = 160,
+ 
+ struct Pad {
+   SDL_Gamepad* gp = nullptr;
++  int rx = -1;  // receiver slot (gp null)
+   uint32_t packet = 0;
+   uint8_t last[12] = {};  // XINPUT_GAMEPAD last reported
+ };
  
  std::mutex g_mu;
  bool g_up = false;
 +bool g_enabled = true;  // XInputEnable
  Pad g_pads[4];
  
++// Gives receiver controllers that connected free user indices and frees
++// those that disconnected; lights each one's quadrant for its index.
++void RefreshReceiver() {
++  x360rx::Start();
++  bool taken[x360rx::kSlots] = {};
++  for (uint32_t i = 0; i < 4; i++) {
++    Pad& p = g_pads[i];
++    if (p.rx < 0) continue;
++    if (!x360rx::Read(p.rx, nullptr)) {
++      p = Pad{};
++      continue;
++    }
++    taken[p.rx] = true;
++    x360rx::SetLed(p.rx, int(i));
++  }
++  for (int s = 0; s < x360rx::kSlots; s++) {
++    if (taken[s] || !x360rx::Read(s, nullptr)) continue;
++    for (uint32_t i = 0; i < 4; i++) {
++      Pad& p = g_pads[i];
++      if (p.gp || p.rx >= 0) continue;
++      p.rx = s;
++      x360rx::SetLed(s, int(i));
++      break;
++    }
++  }
++}
++
  // Opens newly connected gamepads into free slots, frees disconnected ones.
-@@ -115,8 +116,8 @@ HLE_NAMED("xinput1_3.dll", "#2", XInputGetState, 2) {
+ void Refresh() {
++  if (Background()) return;
++  RefreshReceiver();
+   if (!g_up) {
+     if (!OnMainThread() || Background()) return;
+     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+@@ -58,7 +93,7 @@ void Refresh() {
+       if (p.gp && SDL_GetGamepadID(p.gp) == ids[i]) open = true;
+     if (open) continue;
+     for (Pad& p : g_pads) {
+-      if (p.gp) continue;
++      if (p.gp || p.rx >= 0) continue;
+       p.gp = SDL_OpenGamepad(ids[i]);
+       break;
+     }
+@@ -70,7 +105,7 @@ void Refresh() {
+ Pad* PadAt(uint32_t index) {
+   if (index >= 4) return nullptr;
+   Refresh();
+-  return g_pads[index].gp ? &g_pads[index] : nullptr;
++  return g_pads[index].gp || g_pads[index].rx >= 0 ? &g_pads[index] : nullptr;
+ }
+ 
+ int16_t Stick(SDL_Gamepad* gp, SDL_GamepadAxis a, bool flip) {
+@@ -115,8 +150,14 @@ HLE_NAMED("xinput1_3.dll", "#2", XInputGetState, 2) {
    Pad* p = PadAt(Arg(c, 0));
    if (!p) return ERROR_DEVICE_NOT_CONNECTED;
    if (!Arg(c, 1)) return ERROR_BAD_ARGUMENTS;
 -  uint8_t g[12];
 -  ReadGamepad(p->gp, g);
 +  uint8_t g[12] = {};
-+  if (g_enabled) ReadGamepad(p->gp, g);
++  if (g_enabled) {
++    x360rx::SlotState rs;
++    if (p->gp)
++      ReadGamepad(p->gp, g);
++    else if (x360rx::Read(p->rx, &rs))
++      std::memcpy(g, rs.gamepad, sizeof g);
++  }
    if (std::memcmp(g, p->last, sizeof g) != 0) {
      std::memcpy(p->last, g, sizeof g);
      p->packet++;
-@@ -126,6 +127,14 @@ HLE_NAMED("xinput1_3.dll", "#2", XInputGetState, 2) {
+@@ -126,6 +167,14 @@ HLE_NAMED("xinput1_3.dll", "#2", XInputGetState, 2) {
    return ERROR_SUCCESS;
  }
  
@@ -2048,6 +2525,47 @@ index 745e070..f88dd4e 100644
  // XInputSetState(dwUserIndex, pVibration): XINPUT_VIBRATION
  // {wLeftMotorSpeed, wRightMotorSpeed}; held until changed.
  HLE_NAMED("xinput1_3.dll", "#3", XInputSetState, 2) {
+@@ -134,13 +183,17 @@ HLE_NAMED("xinput1_3.dll", "#3", XInputSetState, 2) {
+   if (!p) return ERROR_DEVICE_NOT_CONNECTED;
+   if (!Arg(c, 1)) return ERROR_BAD_ARGUMENTS;
+   uint32_t v = Rd32(Arg(c, 1));
+-  SDL_RumbleGamepad(p->gp, uint16_t(v), uint16_t(v >> 16), 0xFFFFFFFF);
++  if (p->gp)
++    SDL_RumbleGamepad(p->gp, uint16_t(v), uint16_t(v >> 16), 0xFFFFFFFF);
++  else
++    x360rx::SetRumble(p->rx, uint8_t(v >> 8), uint8_t(v >> 24));
+   return ERROR_SUCCESS;
+ }
+ 
+ // XInputGetCapabilities(dwUserIndex, dwFlags, pCapabilities):
+-// XINPUT_CAPABILITIES {Type, SubType, Flags, Gamepad, Vibration}: a
+-// gamepad with every control and both motors.
++// XINPUT_CAPABILITIES {Type, SubType, Flags, Gamepad, Vibration}: every
++// control and both motors; the subtype is a gamepad's, or for a receiver
++// controller the one it announced.
+ HLE_NAMED("xinput1_3.dll", "#4", XInputGetCapabilities, 3) {
+   std::lock_guard<std::mutex> l(g_mu);
+   Pad* p = PadAt(Arg(c, 0));
+@@ -150,6 +203,8 @@ HLE_NAMED("xinput1_3.dll", "#4", XInputGetCapabilities, 3) {
+   uint8_t caps[20] = {};
+   caps[0] = 1;  // XINPUT_DEVTYPE_GAMEPAD
+   caps[1] = 1;  // XINPUT_DEVSUBTYPE_GAMEPAD
++  x360rx::SlotState rs;
++  if (!p->gp && x360rx::Read(p->rx, &rs)) caps[1] = rs.subtype;
+   const uint16_t buttons = 0xF3FF;
+   std::memcpy(caps + 4, &buttons, 2);
+   caps[6] = caps[7] = 0xFF;
+@@ -167,6 +222,10 @@ std::vector<XInputPad> XInputPads() {
+   std::vector<XInputPad> pads;
+   for (uint32_t i = 0; i < 4; i++) {
+     SDL_Gamepad* gp = g_pads[i].gp;
++    if (g_pads[i].rx >= 0) {  // as Windows lists the receiver's controllers
++      pads.push_back({i, 0x045E, 0x0719, "Controller (Xbox 360 Wireless Receiver for Windows)"});
++      continue;
++    }
+     if (!gp) continue;
+     const char* name = SDL_GetGamepadName(gp);
+     pads.push_back({i, SDL_GetGamepadVendor(gp), SDL_GetGamepadProduct(gp),
 diff --git a/src/runtime/audio/mixer.cpp b/src/runtime/audio/mixer.cpp
 index 2331e6a..840cf16 100644
 --- a/src/runtime/audio/mixer.cpp
