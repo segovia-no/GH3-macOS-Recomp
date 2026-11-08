@@ -14,8 +14,9 @@
 //   columns (position, normal, tangent, binormal), then weights wA, wB.
 // - Per bone, row r (x, y, z) of column k: (X[k]*m[r] + Y[k]*m[4+r]) +
 //   Z[k]*m[8+r], plus the translation m[12+r] for the position. Two bones:
-//   A*wA + B*wB. Three bones, with wC = (1 - wA) - wB: x and z rows
-//   (C*wC + B*wB) + A*wA, the y row (C*wC + A*wA) + B*wB.
+//   A*wA + B*wB. Three bones, with wC = (1 - wA) - wB: C*wC + (A*wA +
+//   B*wB) (the A and B terms are summed first; the decompiler's flat
+//   "C*wC + B*wB + A*wA" hides that grouping, GH3_VERIFY_SKIN caught it).
 // - Normal, tangent and binormal are scaled by RSQRTPS of their squared
 //   length ((y*y + x*x) + z*z); the position is not.
 // - Output per vertex, three 16-byte stores: px py pz nx | ny nz tx ty |
@@ -111,9 +112,7 @@ Skinned Skin(const uint8_t* B, uint32_t bones, uint32_t header, uint8_t* out,
               const float wc = (1.0f - wa) - wb;
               float cc[4];
               BoneRow(mc, r, X, Y, Z, cc);
-              for (int k = 0; k < 4; k++)
-                R[r][k] = r == 1 ? (cc[k] * wc + a[k] * wa) + b[k] * wb
-                                 : (cc[k] * wc + b[k] * wb) + a[k] * wa;
+              for (int k = 0; k < 4; k++) R[r][k] = cc[k] * wc + (a[k] * wa + b[k] * wb);
             }
           }
         }
