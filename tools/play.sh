@@ -46,7 +46,7 @@ if [ -n "$GH3_PROFILE" ]; then
     start=$(date +%s)
     sleep 10
     while kill -0 $pid 2>/dev/null; do
-      gpid=$(pgrep -f 'GH3.app/Contents/MacOS/gh3' | head -1)
+      gpid=$(pgrep -x gh3 | head -1)
       [ -n "$gpid" ] && sample "$gpid" 5 -file "prof/t$(( $(date +%s) - start )).txt" >/dev/null 2>&1
       sleep 10
     done
