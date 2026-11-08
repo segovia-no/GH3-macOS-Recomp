@@ -2,7 +2,7 @@
 """Compare GH3.exe imports against the HLE handlers SwARc registers.
 
 Usage:
-  python3 -I tools/import_coverage.py <imports.tsv> <swarc_win32_src_dir> [--out file.tsv]
+  python3 -I tools/import_coverage.py <imports.tsv> <hle_src_dir>... [--out file.tsv]
 
 imports.tsv comes from SwARc's tools/pe_symbols.py (iat_va, dll, symbol).
 HLE handlers are found by scanning for HLE("dll", Name, argc) in the sources.
@@ -18,6 +18,8 @@ import sys
 HLE_RE = re.compile(r'\bHLE(?:64)?\(\s*"([^"]+)"\s*,\s*([A-Za-z0-9_@?$]+)\s*,')
 # HLE_NAMED(dll, "export", ident, n) / HLE_NAMED_X(...): quoted export name.
 HLE_NAMED_RE = re.compile(r'\bHLE_NAMED(?:_X)?\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,')
+# Winsock's RECOMP_WS2(ordinal, Name, n): registered by name and as "#ordinal".
+WS2_RE = re.compile(r'\bRECOMP_WS2\(\s*(\d+)\s*,\s*([A-Za-z0-9_]+)\s*,')
 
 
 def load_imports(path):
@@ -42,18 +44,23 @@ def load_hle(src_dir):
                 for rx in (HLE_RE, HLE_NAMED_RE):
                     for dll, fn in rx.findall(text):
                         have.add((dll.lower(), fn))
+                for ord_, fn in WS2_RE.findall(text):
+                    have.add(("ws2_32.dll", fn))
+                    have.add(("ws2_32.dll", "#" + ord_))
     return have
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("imports")
-    ap.add_argument("src")
+    ap.add_argument("src", nargs="+")
     ap.add_argument("--out")
     a = ap.parse_args()
 
     imports = load_imports(a.imports)
-    have = load_hle(a.src)
+    have = set()
+    for src in a.src:
+        have |= load_hle(src)
     hle_dlls = {d for d, _ in have}
 
     per = collections.OrderedDict()

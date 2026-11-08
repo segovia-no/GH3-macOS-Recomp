@@ -520,7 +520,7 @@ index 88f7db7..25c543b 100644
  
  uint32_t BufferQueryInterface(Ctx& c) {
 diff --git a/platforms/win32/src/win32/d3dx9.cpp b/platforms/win32/src/win32/d3dx9.cpp
-index 62cb420..c57faef 100644
+index 62cb420..9dcfcd0 100644
 --- a/platforms/win32/src/win32/d3dx9.cpp
 +++ b/platforms/win32/src/win32/d3dx9.cpp
 @@ -1,7 +1,8 @@
@@ -1061,6 +1061,57 @@ index 62cb420..c57faef 100644
  // ---- maths -----------------------------------------------------------------------------
  // In single precision, operations in the order D3DX evaluates them (built
  // without FMA contraction, see CMakeLists.txt): the game's own maths uses
+@@ -350,6 +799,50 @@ HLE("d3dx9_35.dll", D3DXMatrixOrthoLH, 5) {
+   return Arg(c, 0);
+ }
+ 
++// (pOut, w, h, zn, zf): right-handed; z maps to [0, 1] from -zn to -zf.
++HLE("d3dx9_35.dll", D3DXMatrixOrthoRH, 5) {
++  auto f = [&](int i) {
++    uint32_t v = Arg(c, i);
++    float x;
++    std::memcpy(&x, &v, 4);
++    return x;
++  };
++  float w = f(1), h = f(2), zn = f(3), zf = f(4);
++  Mat m{};
++  m[0] = 2.0f / w;
++  m[5] = 2.0f / h;
++  m[10] = 1.0f / (zn - zf);
++  m[14] = zn / (zn - zf);
++  m[15] = 1.0f;
++  WriteMatrix(Arg(c, 0), m);
++  return Arg(c, 0);
++}
++
++// (pOut, pEye, pAt, pUp): right-handed, z axis from the target to the eye.
++HLE("d3dx9_35.dll", D3DXMatrixLookAtRH, 4) {
++  Vec3 eye = ReadVec3(Arg(c, 1)), at = ReadVec3(Arg(c, 2)), up = ReadVec3(Arg(c, 3));
++  Vec3 z = Normalize(Sub(eye, at));
++  Vec3 x = Normalize(Cross(up, z));
++  Vec3 y = Cross(z, x);
++  Mat m = {x.x, y.x, z.x, 0, x.y, y.y, z.y, 0, x.z, y.z, z.z, 0,
++           -Dot(x, eye), -Dot(y, eye), -Dot(z, eye), 1};
++  WriteMatrix(Arg(c, 0), m);
++  return Arg(c, 0);
++}
++
++// (pOut, pV, pM): (x, y, z, 1) * M, divided by the resulting w.
++HLE("d3dx9_35.dll", D3DXVec3TransformCoord, 3) {
++  Vec3 v = ReadVec3(Arg(c, 1));
++  Mat m = ReadMatrix(Arg(c, 2));
++  float x = v.x * m[0] + v.y * m[4] + v.z * m[8] + m[12];
++  float y = v.x * m[1] + v.y * m[5] + v.z * m[9] + m[13];
++  float z = v.x * m[2] + v.y * m[6] + v.z * m[10] + m[14];
++  float w = v.x * m[3] + v.y * m[7] + v.z * m[11] + m[15];
++  float r[3] = {x / w, y / w, z / w};
++  std::memcpy(GPtr(Arg(c, 0)), r, sizeof r);
++  return Arg(c, 0);
++}
++
+ // ---- ID3DXBuffer ------------------------------------------------------------------------
+ 
+ struct XBuffer : com::Object {
 diff --git a/platforms/win32/src/win32/dsound.cpp b/platforms/win32/src/win32/dsound.cpp
 index 7c8dc7c..adbf986 100644
 --- a/platforms/win32/src/win32/dsound.cpp
@@ -1211,7 +1262,7 @@ index 2a04eb3..91dc443 100644
  // ---- time ----------------------------------------------------------------
  
 diff --git a/platforms/win32/src/win32/kernel32_file.cpp b/platforms/win32/src/win32/kernel32_file.cpp
-index 1521986..c437f4f 100644
+index 1521986..36ad45e 100644
 --- a/platforms/win32/src/win32/kernel32_file.cpp
 +++ b/platforms/win32/src/win32/kernel32_file.cpp
 @@ -370,6 +370,41 @@ int FdOf(uint64_t h) {
@@ -1292,6 +1343,75 @@ index 1521986..c437f4f 100644
  HLE64("kernel32.dll", SetFilePointer, 4) {
    int fd = FdOf(Arg(c, 0));
    int64_t dist = int32_t(Arg(c, 1));
+@@ -512,6 +560,23 @@ uint32_t GetFileAttributes(const std::string& g) {
+ HLE64("kernel32.dll", GetFileAttributesA, 1) { return GetFileAttributes(GStr(Arg(c, 0))); }
+ HLE64("kernel32.dll", GetFileAttributesW, 1) { return GetFileAttributes(WidePath(Arg(c, 0))); }
+ 
++// (lpFileName, fInfoLevelId (GetFileExInfoStandard), lpFileInformation):
++// WIN32_FILE_ATTRIBUTE_DATA {dwFileAttributes, ftCreationTime,
++// ftLastAccessTime, ftLastWriteTime, nFileSizeHigh, nFileSizeLow}.
++HLE("kernel32.dll", GetFileAttributesExA, 3) {
++  struct stat st;
++  uint32_t a;
++  if (!StatGuest(GStr(Arg(c, 0)), &st, &a)) return 0;
++  gaddr o = Arg(c, 2);
++  Wr32(o, a);
++  PutFileTime(o + 4, platform::StatModifyTime(st));
++  PutFileTime(o + 12, platform::StatAccessTime(st));
++  PutFileTime(o + 20, platform::StatModifyTime(st));
++  Wr32(o + 28, uint32_t(uint64_t(st.st_size) >> 32));
++  Wr32(o + 32, uint32_t(st.st_size));
++  return 1;
++}
++
+ // GetFileAttributesExW(path, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA*).
+ HLE64("kernel32.dll", GetFileAttributesExW, 3) {
+   if (Arg(c, 1) != 0) FatalF("GetFileAttributesExW: info level %llu", (unsigned long long)Arg(c, 1));
+diff --git a/platforms/win32/src/win32/kernel32_sync.cpp b/platforms/win32/src/win32/kernel32_sync.cpp
+index c39bf86..2053241 100644
+--- a/platforms/win32/src/win32/kernel32_sync.cpp
++++ b/platforms/win32/src/win32/kernel32_sync.cpp
+@@ -344,6 +344,40 @@ uint64_t WaitOne(const Ctx& c) {
+   return WaitObjects({w}, false, uint32_t(Arg(c, 1)));
+ }
+ HLE64("kernel32.dll", WaitForSingleObject, 2) { return WaitOne(c); }
++
++// (hObjectToSignal, hObjectToWaitOn, dwMilliseconds, bAlertable): signals
++// an event (SetEvent), mutex (ReleaseMutex) or semaphore (by 1), then
++// waits on the other object.
++HLE("kernel32.dll", SignalObjectAndWait, 4) {
++  GuestSyncPoint sync;
++  uint32_t sig = Arg(c, 0);
++  if (!SignalEventHandle(sig, false)) {
++    gaddr k32 = ModuleHandle("kernel32.dll");
++    if (!uint32_t(CallGuest(c, ProcAddress(k32, "ReleaseMutex"), {sig})) &&
++        !uint32_t(CallGuest(c, ProcAddress(k32, "ReleaseSemaphore"), {sig, 1, 0}))) {
++      SetLastError(kErrorInvalidHandle);
++      return kWaitFailed;
++    }
++  }
++  auto w = AsWaitable(uint32_t(Arg(c, 1)));
++  if (!w) {
++    SetLastError(kErrorInvalidHandle);
++    return kWaitFailed;
++  }
++  return WaitObjects({w}, false, uint32_t(Arg(c, 2)));
++}
++
++// (hThread, lpExitCode): STILL_ACTIVE (259) until the thread has finished.
++HLE("kernel32.dll", GetExitCodeThread, 2) {
++  auto to = std::dynamic_pointer_cast<ThreadObject>(GetHandle(uint32_t(Arg(c, 0))));
++  if (!to) {
++    SetLastError(kErrorInvalidHandle);
++    return 0;
++  }
++  std::lock_guard<std::mutex> l(g_wait_mu);
++  Wr32(Arg(c, 1), to->finished ? to->exit_code : 259u);
++  return 1;
++}
+ HLE64("kernel32.dll", WaitForSingleObjectEx, 3) { return WaitOne(c); }
+ 
+ HLE64("kernel32.dll", WaitForMultipleObjects, 4) {
 diff --git a/platforms/win32/src/win32/pe_image.cpp b/platforms/win32/src/win32/pe_image.cpp
 index 1f2d0dc..75e859f 100644
 --- a/platforms/win32/src/win32/pe_image.cpp
