@@ -2258,7 +2258,7 @@ index af56713..e8e4944 100644
    return g_main_exit;
  }
 diff --git a/src/x86/sse.cpp b/src/x86/sse.cpp
-index 19e4386..212449a 100644
+index 19e4386..d160508 100644
 --- a/src/x86/sse.cpp
 +++ b/src/x86/sse.cpp
 @@ -10,6 +10,10 @@
@@ -2295,10 +2295,14 @@ index 19e4386..212449a 100644
    if (dbl)
      SqrtT<true>(c, lanes, d, s, va);
    else
-@@ -373,6 +380,26 @@ uint32_t RsqrtLane(uint32_t x) {
+@@ -373,12 +380,22 @@ uint32_t RsqrtLane(uint32_t x) {
    }
  }
  
+-void Rsqrt(Xmm& d, const Xmm& s) {
+-  Xmm r;
+-  for (int i = 0; i < 4; i++) SetLane<uint32_t>(r, i, RsqrtLane(Lane<uint32_t>(s, i)));
+-  d = r;
 +uint32_t RcpLane(uint32_t x) {
 +  const uint32_t sign = x & 0x80000000u, exp = (x >> 23) & 0xFF, frac = x & 0x7FFFFF;
 +  if (exp == 0xFF && frac) return x | 0x00400000u;  // NaN: quieted
@@ -2311,18 +2315,14 @@ index 19e4386..212449a 100644
 +  softfloat_exceptionFlags = flags;
 +  if (((r >> 23) & 0xFF) == 0) return sign;  // denormal result: ±0
 +  return r;
-+}
+ }
+ 
 +
-+void Rcp(Xmm& d, const Xmm& s) {
-+  Xmm r;
-+  for (int i = 0; i < 4; i++) SetLane<uint32_t>(r, i, RcpLane(Lane<uint32_t>(s, i)));
-+  d = r;
-+}
 +
- void Rsqrt(Xmm& d, const Xmm& s) {
-   Xmm r;
-   for (int i = 0; i < 4; i++) SetLane<uint32_t>(r, i, RsqrtLane(Lane<uint32_t>(s, i)));
-@@ -413,15 +440,15 @@ uint64_t CvtToI64(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va) {
+ void Cvtsi2sd(Xmm& d, int32_t v) { SetLane<uint64_t>(d, 0, i32_to_f64(v).v); }
+ 
+ uint32_t CvtToI32(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va) {
+@@ -413,15 +430,15 @@ uint64_t CvtToI64(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va) {
    return uint64_t(r);
  }
  
@@ -2341,7 +2341,7 @@ index 19e4386..212449a 100644
    Scope sc(c, va);
    Xmm r = d;
    if (to_dbl) {
-@@ -437,6 +464,19 @@ void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va)
+@@ -437,6 +454,19 @@ void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va)
  }
  
  void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va) {
@@ -2362,7 +2362,7 @@ index 19e4386..212449a 100644
    sc.Begin();
    if (dbl)
 diff --git a/src/x86/sse.h b/src/x86/sse.h
-index 3622a7a..909564f 100644
+index 3622a7a..123d54f 100644
 --- a/src/x86/sse.h
 +++ b/src/x86/sse.h
 @@ -14,6 +14,7 @@
@@ -2395,7 +2395,7 @@ index 3622a7a..909564f 100644
 -void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
 -           uint64_t va);
 +void ArithExact(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
-+inline void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
++[[gnu::always_inline]] inline void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
 +  bool done;
 +  switch (op) {
 +    case kAdd: done = dbl ? fast::Arith<true, 0>(c, lanes, d, s) : fast::Arith<false, 0>(c, lanes, d, s); break;
@@ -2408,41 +2408,59 @@ index 3622a7a..909564f 100644
  
  // CMPPS/PD/SS/SD: each lane of d becomes all ones if `d pred s` holds,
  // else zero. pred is the imm8 (0 EQ, 1 LT, 2 LE, 3 UNORD, 4 NEQ, 5 NLT,
-@@ -76,7 +92,11 @@ int Comi(Ctx& c, bool dbl, bool ordered, const Xmm& a, const Xmm& b,
+@@ -76,13 +92,42 @@ int Comi(Ctx& c, bool dbl, bool ordered, const Xmm& a, const Xmm& b,
  
  // SQRTSD/SQRTSS/SQRTPD/SQRTPS: d = sqrt(s), lane-wise; scalar forms keep
  // the upper lanes of d.
 -void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
 +void SqrtExact(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
-+inline void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
++[[gnu::always_inline]] inline void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
 +  if (!(dbl ? fast::Sqrt<true>(c, lanes, d, s) : fast::Sqrt<false>(c, lanes, d, s)))
 +    SqrtExact(c, dbl, lanes, d, s, va);
 +}
  
  // RSQRTPS: d = 1/sqrt(s) in all four float lanes (see above). No flags:
  // ±0 and denormals give ±inf, negative values the default NaN, +inf +0,
-@@ -84,6 +104,13 @@ void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
- void Rsqrt(Xmm& d, const Xmm& s);
+ // NaNs themselves quieted.
+-void Rsqrt(Xmm& d, const Xmm& s);
++// RsqrtLane is the exact model (tests/x86/sse_rsqrt_test); the inline
++// forms try sse_fast.h's first.
  uint32_t RsqrtLane(uint32_t x);
- 
++[[gnu::always_inline]] inline uint32_t RsqrtLaneFast(uint32_t x) {
++  uint32_t r;
++  return fast::RsqrtLane(x, &r) ? r : RsqrtLane(x);
++}
++[[gnu::always_inline]] inline void Rsqrt(Xmm& d, const Xmm& s) {
++  uint32_t r[4];
++  for (int i = 0; i < 4; i++) r[i] = RsqrtLaneFast(Lane<uint32_t>(s, i));
++  __builtin_memcpy(d.b, r, 16);
++}
++
 +// RCPPS: d = 1/s in all four float lanes, correctly rounded (see above).
 +// No flags. As on the hardware, denormal operands count as ±0 (±inf) and
 +// results too small for a normal float flush to ±0; ±inf gives ±0, NaNs
 +// are quieted.
-+void Rcp(Xmm& d, const Xmm& s);
 +uint32_t RcpLane(uint32_t x);
-+
++[[gnu::always_inline]] inline uint32_t RcpLaneFast(uint32_t x) {
++  uint32_t r;
++  return fast::RcpLane(x, &r) ? r : RcpLane(x);
++}
++[[gnu::always_inline]] inline void Rcp(Xmm& d, const Xmm& s) {
++  uint32_t r[4];
++  for (int i = 0; i < 4; i++) r[i] = RcpLaneFast(Lane<uint32_t>(s, i));
++  __builtin_memcpy(d.b, r, 16);
++}
+ 
  // CVTSI2SD: the low lane of d = (double)v (always exact).
  void Cvtsi2sd(Xmm& d, int32_t v);
- 
-@@ -96,12 +123,18 @@ uint64_t CvtToI64(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va);
+@@ -96,12 +141,18 @@ uint64_t CvtToI64(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va);
  // MINSS/SD/PS/PD (max = false) and MAXSS/SD/PS/PD, lane-wise: d op s ? d : s.
  // A NaN in either operand (invalid, quiet ones too) or equal values,
  // zeros of either sign included, give s. Scalar forms keep d's upper lanes.
 -void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
 -            uint64_t va);
 +void MinMaxExact(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
-+inline void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
++[[gnu::always_inline]] inline void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
 +  if (!(dbl ? fast::MinMax<true>(c, max, lanes, d, s) : fast::MinMax<false>(c, max, lanes, d, s)))
 +    MinMaxExact(c, max, dbl, lanes, d, s, va);
 +}
@@ -2451,30 +2469,34 @@ index 3622a7a..909564f 100644
  // Scalar forms keep d's other lanes; CVTPD2PS zeroes its upper half.
 -void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
 +void CvtFloatExact(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
-+inline void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
++[[gnu::always_inline]] inline void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
 +  if (!fast::CvtFloat(c, to_dbl, lanes, d, s)) CvtFloatExact(c, to_dbl, lanes, d, s, va);
 +}
  
  // CVTSI2SS / CVTSI2SD of a 32-bit or 64-bit (src64) integer into the low
  // lane, rounded by MXCSR (only int64 -> double and int -> float can be
-@@ -113,6 +146,11 @@ void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va);
+@@ -113,9 +164,14 @@ void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va);
  // int32, 0x80000000 for NaN and out of range (invalid).
  void CvtToDq(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s, uint64_t va);
  
 +// RCPSS: the low lane of d = 1/(the low lane of s), as RcpLane.
 +inline void RcpSs(Xmm& d, const Xmm& s) {
-+  SetLane<uint32_t>(d, 0, RcpLane(Lane<uint32_t>(s, 0)));
++  SetLane<uint32_t>(d, 0, RcpLaneFast(Lane<uint32_t>(s, 0)));
 +}
 +
  // RSQRTSS: the low lane of d = 1/sqrt(the low lane of s), as RsqrtLane.
  inline void RsqrtSs(Xmm& d, const Xmm& s) {
-   SetLane<uint32_t>(d, 0, RsqrtLane(Lane<uint32_t>(s, 0)));
+-  SetLane<uint32_t>(d, 0, RsqrtLane(Lane<uint32_t>(s, 0)));
++  SetLane<uint32_t>(d, 0, RsqrtLaneFast(Lane<uint32_t>(s, 0)));
+ }
+ 
+ // CVTDQ2PS: four int32 lanes to float, rounded by MXCSR.
 diff --git a/src/x86/sse_fast.h b/src/x86/sse_fast.h
 new file mode 100644
-index 0000000..b9004a6
+index 0000000..c87d13c
 --- /dev/null
 +++ b/src/x86/sse_fast.h
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,238 @@
 +// Host fast paths for SSE floating point, inline so lifted code gets them
 +// without a call (sse.h's Arith, Sqrt, MinMax and CvtFloat try these first
 +// and fall back to the exact SoftFloat paths in sse.cpp).
@@ -2534,20 +2556,20 @@ index 0000000..b9004a6
 +};
 +
 +template <bool D>
-+inline bool NormalOrZero(typename Bits<D>::U v) {
++[[gnu::always_inline]] inline bool NormalOrZero(typename Bits<D>::U v) {
 +  const typename Bits<D>::U e = v & Bits<D>::kExp;
 +  return e != Bits<D>::kExp && (e != 0 || !(v & Bits<D>::kFrac));
 +}
 +
 +// A finite, normal or zero result.
 +template <bool D>
-+inline bool NormalResult(typename Bits<D>::U r) {
++[[gnu::always_inline]] inline bool NormalResult(typename Bits<D>::U r) {
 +  const typename Bits<D>::U e = r & Bits<D>::kExp;
 +  return e != Bits<D>::kExp && (e != 0 || !(r & Bits<D>::kFrac));
 +}
 +
 +template <bool D, int Op>  // Op: sse::Op (kAdd, kSub, kMul, kDiv)
-+inline bool ArithLane(typename Bits<D>::U a, typename Bits<D>::U b, typename Bits<D>::U* out,
++[[gnu::always_inline]] inline bool ArithLane(typename Bits<D>::U a, typename Bits<D>::U b, typename Bits<D>::U* out,
 +                      bool need_pe, bool* inexact) {
 +  using T = typename Bits<D>::T;
 +  using U = typename Bits<D>::U;
@@ -2588,7 +2610,7 @@ index 0000000..b9004a6
 +}
 +
 +template <bool D, int Op>
-+inline bool Arith(Ctx& c, int lanes, Xmm& d, const Xmm& s) {
++[[gnu::always_inline]] inline bool Arith(Ctx& c, int lanes, Xmm& d, const Xmm& s) {
 +  using U = typename Bits<D>::U;
 +  if (!g_fast_path || (c.mxcsr & kControlMask) != kDefaultControl) return false;
 +  U r[4];
@@ -2606,7 +2628,7 @@ index 0000000..b9004a6
 +}
 +
 +template <bool D>
-+inline bool Sqrt(Ctx& c, int lanes, Xmm& d, const Xmm& s) {
++[[gnu::always_inline]] inline bool Sqrt(Ctx& c, int lanes, Xmm& d, const Xmm& s) {
 +  using T = typename Bits<D>::T;
 +  using U = typename Bits<D>::U;
 +  if (!g_fast_path || (c.mxcsr & kControlMask) != kDefaultControl) return false;
@@ -2629,7 +2651,7 @@ index 0000000..b9004a6
 +}
 +
 +template <bool D>
-+inline bool MinMax(Ctx& c, bool max, int lanes, Xmm& d, const Xmm& s) {
++[[gnu::always_inline]] inline bool MinMax(Ctx& c, bool max, int lanes, Xmm& d, const Xmm& s) {
 +  using T = typename Bits<D>::T;
 +  using U = typename Bits<D>::U;
 +  if (!g_fast_path || (c.mxcsr & kControlMask) != kDefaultControl) return false;
@@ -2646,7 +2668,7 @@ index 0000000..b9004a6
 +  return true;
 +}
 +
-+inline bool CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s) {
++[[gnu::always_inline]] inline bool CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s) {
 +  if (!g_fast_path || (c.mxcsr & kControlMask) != kDefaultControl) return false;
 +  if (to_dbl) {
 +    uint64_t r[2];
@@ -2679,6 +2701,38 @@ index 0000000..b9004a6
 +  return true;
 +}
 +
++// RSQRTPS/RCPPS lanes (sse.h: the correctly rounded value, no flags).
++// For a positive normal x, 1/sqrt(x) computed in binary64 (sqrt and the
++// division each correctly rounded) is within 2^-51 relative of the exact
++// value, so rounding it to binary32 gives the correctly rounded result
++// unless the double lies within a few ulps of a float rounding midpoint:
++// those lanes return false for the exact check. (tests/x86/sse_fast_test
++// covers every significand at both exponent parities, which by the exact
++// scaling rsqrt(4x) = rsqrt(x) / 2 is every normal input: none comes that
++// close, so the check is a margin that never fires.)
++// 1/x for a normal float is one correctly rounded host division; a result
++// below the normal range (flushed by RCPPS) returns false.
++[[gnu::always_inline]] inline bool RsqrtLane(uint32_t x, uint32_t* out) {
++  const uint32_t e = x & 0x7F800000u;
++  if ((x & 0x80000000u) || e == 0 || e == 0x7F800000u) return false;
++  const double r = 1.0 / std::sqrt(double(std::bit_cast<float>(x)));
++  const uint64_t rb = std::bit_cast<uint64_t>(r);
++  const uint64_t low = rb & ((uint64_t(1) << 29) - 1);  // bits float drops
++  const uint64_t mid = uint64_t(1) << 28;
++  if ((low > mid ? low - mid : mid - low) <= 8) return false;
++  *out = std::bit_cast<uint32_t>(float(r));
++  return true;
++}
++
++[[gnu::always_inline]] inline bool RcpLane(uint32_t x, uint32_t* out) {
++  const uint32_t e = x & 0x7F800000u;
++  if (e == 0 || e == 0x7F800000u) return false;
++  const uint32_t r = std::bit_cast<uint32_t>(1.0f / std::bit_cast<float>(x));
++  if (!(r & 0x7F800000u)) return false;  // denormal or zero: flushed
++  *out = r;
++  return true;
++}
++
 +}  // namespace fast
 +}  // namespace recomp::sse
 diff --git a/tests/x86/CMakeLists.txt b/tests/x86/CMakeLists.txt
@@ -2706,10 +2760,10 @@ index 6f096e8..94357c9 100644
  add_executable(hle_abi_test hle_abi_test.cpp)
 diff --git a/tests/x86/sse_fast_test.cpp b/tests/x86/sse_fast_test.cpp
 new file mode 100644
-index 0000000..c162a0c
+index 0000000..f6db7af
 --- /dev/null
 +++ b/tests/x86/sse_fast_test.cpp
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,194 @@
 +// The host fast paths (sse_fast.h; CvtIntToF's in sse.cpp) of Arith,
 +// Sqrt, MinMax, CvtFloat and CvtIntToF against the exact SoftFloat paths: random add/sub/mul/div of float and double lanes, biased
 +// towards the edges of the fast path (near overflow and underflow, exact
@@ -2866,9 +2920,27 @@ index 0000000..c162a0c
 +                (unsigned long long)v, c1.mxcsr, c2.mxcsr);
 +}
 +
++// RSQRTPS/RCPPS lanes: every significand at two exponents (and both signs
++// for rcp), then random patterns, fast against exact.
++void CheckRecip() {
++  auto one = [](uint32_t x) {
++    if (recomp::sse::RsqrtLaneFast(x) != recomp::sse::RsqrtLane(x) && ++g_fail <= 20)
++      std::printf("FAIL rsqrt %08x: fast %08x exact %08x\n", x, recomp::sse::RsqrtLaneFast(x),
++                  recomp::sse::RsqrtLane(x));
++    if (recomp::sse::RcpLaneFast(x) != recomp::sse::RcpLane(x) && ++g_fail <= 20)
++      std::printf("FAIL rcp %08x: fast %08x exact %08x\n", x, recomp::sse::RcpLaneFast(x),
++                  recomp::sse::RcpLane(x));
++  };
++  for (uint32_t e : {127u, 128u})
++    for (uint32_t f = 0; f < 0x800000u; f++) one(e << 23 | f);
++  for (uint32_t f = 0; f < 0x800000u; f += 7) one(0x80000000u | 127u << 23 | f);
++  for (int i = 0; i < 4000000; i++) one(uint32_t(Rand()));
++}
++
 +}  // namespace
 +
 +int main() {
++  CheckRecip();
 +  const int n = 2000000;
 +  for (int i = 0; i < n; i++) {
 +    auto op = recomp::sse::Op(i % 4);
