@@ -257,3 +257,21 @@ Each line is the fatal stop after the previous fix. `tools/boot.sh`.
 - `recomp/src/awl.cpp`: `Video.Width/Height` default to the largest 16:9 display mode within 85% of the desktop: **2560x1440** here (a 1280x720-point window, sharp on Retina). `GH3_RESOLUTION=WxH` overrides it; a value saved in AspyrConfig.ini wins. fps at 2560x1440: median 116, p10 77.
 - Focus: a bare binary started from a terminal never becomes the active app on macOS (window opens behind, keyboard stays with the terminal). `tools/play.sh` now builds `work/GH3.app` (binary symlinked in; the rpaths are absolute) and launches it with `open -W -n --stdout/--stderr`, so it comes up frontmost with keyboard focus. Verified: frontmost process is `gh3` after launch.
 - `GH3_FULLSCREEN=desktop` (SwARc) gives borderless fullscreen; `play.sh` passes it and the other GH3_* options through `open --env`.
+
+## Gameplay performance (observed, user sessions with GH3_PROFILE=1)
+
+Gameplay fps (between profiler windows; macOS `sample` pauses the game, so the 5 s windows every 15 s dip and are excluded):
+
+| Build | Gameplay fps | Main change |
+|---|---|---|
+| `083be42` | 15-18 | (Havok fixed; menus already ~120) |
+| `09028bb` | 35-60 | SSE add/sub/mul/div + conversions: host fast path in sse.cpp (was SoftFloat, ~55% of the main thread) |
+| `d925878`, `9b91ad8` | 47-89 | fast paths inlined into lifted code (`x86/sse_fast.h`), sqrt and min/max, sticky-PE skip, GPU submissions pipelined (64 in flight, 256 MB staging cap) |
+| `8c89c7d` | **62-104** (mostly 65-100) | fast paths force-inlined (the compiler had declined in the biggest functions); RSQRTPS/RCPPS fast exact lanes |
+
+- Every fast path gives the exact model's bits and MXCSR flags. `tests/x86/sse_fast_test` fuzzes each against the SoftFloat path (rsqrt/rcp exhaustively over significands). Planted mutations are caught, except the rsqrt midpoint margin, which the exhaustive test shows never fires.
+- What remains on the main thread (`work/prof/t57.txt`, 8c89c7d):
+  - **44%: `f_0061C590`**, a large hand-written SSE kernel, called from 0x61E260 ← 0x58A920 (render/update). Uses rsqrtps normalisation and movntps streaming stores: most likely CPU skinning of character meshes (bone-matrix transforms of positions and normals). All of its SSE is inline now; the rest is the cost of emulating it instruction by instruction. **Next lever: a native replacement** (`replace 0061c590`, written from the decompilation, verified against the lifted body).
+  - 19%: game logic under 0x4A2E70/0x65C770 (diffuse).
+  - 16%: render submission (0x5FA040 → D3D9 HLE draws and render-target binds).
+- FMOD's mixer thread uses ~75% of another core (C mixing paths forced by the CPU-probe replacements). It's off the critical path but could later get its own SSE path once the lifter has MMX, or a native mixer.
