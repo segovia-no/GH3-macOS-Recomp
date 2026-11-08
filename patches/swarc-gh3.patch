@@ -1730,7 +1730,7 @@ index ce8f08b..bba5bd3 100644
    std::lock_guard<std::recursive_mutex> l(g_mu);
    Window* w = Win(Arg(c, 0));
 diff --git a/platforms/win32/src/win32/ws2_32.cpp b/platforms/win32/src/win32/ws2_32.cpp
-index 3e3ae1f..15c55cf 100644
+index 3e3ae1f..96b403f 100644
 --- a/platforms/win32/src/win32/ws2_32.cpp
 +++ b/platforms/win32/src/win32/ws2_32.cpp
 @@ -5,14 +5,19 @@
@@ -1753,7 +1753,7 @@ index 3e3ae1f..15c55cf 100644
  
  #include "runtime/log.h"
  #include "win32/hle.h"
-@@ -279,4 +284,250 @@ HLE64("ws2_32.dll", inet_ntop, 4) {
+@@ -279,4 +284,256 @@ HLE64("ws2_32.dll", inet_ntop, 4) {
    return Arg(c, 2);
  }
  
@@ -1843,6 +1843,12 @@ index 3e3ae1f..15c55cf 100644
 +      case 0x0020: hn = SO_BROADCAST; break;
 +      case 0x1001: hn = SO_SNDBUF; break;
 +      case 0x1002: hn = SO_RCVBUF; break;
++      case 0xFFFFFFFB:  // SO_EXCLUSIVEADDRUSE (~SO_REUSEADDR): what BSD sockets do
++        return 0;         // without SO_REUSEADDR anyway
++      case 0xFFFFFF7F: {  // SO_DONTLINGER (~SO_LINGER): BOOL, linger off if set
++        linger l{v ? 0 : 1, 0};
++        return ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof l) == 0 ? 0 : FailErrno();
++      }
 +      case 0x0080: {  // SO_LINGER: {u_short onoff, u_short linger}
 +        linger l{Rd16(val), Rd16(val + 2)};
 +        return ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof l) == 0 ? 0 : FailErrno();
