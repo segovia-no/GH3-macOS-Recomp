@@ -2308,10 +2308,20 @@ index 0000000..233be12
 +  return 0;
 +}
 diff --git a/tools/lifter_x86/emit.cpp b/tools/lifter_x86/emit.cpp
-index f73425f..4bce368 100644
+index f73425f..301d816 100644
 --- a/tools/lifter_x86/emit.cpp
 +++ b/tools/lifter_x86/emit.cpp
-@@ -1696,6 +1696,18 @@ void InsnEmitter::EmitSse() {
+@@ -1560,6 +1560,9 @@ void InsnEmitter::EmitSse() {
+       L(Fmt("::recomp::sse::%s(%s, %s);", fn, XmmRef(0).c_str(), s.c_str()));
+       return;
+     }
++    // MOVNTPS/MOVNTPD/MOVNTDQ: aligned stores with a non-temporal hint,
++    // which only affects caching; the stored value is MOVAPS's.
++    case ZYDIS_MNEMONIC_MOVNTPS: case ZYDIS_MNEMONIC_MOVNTPD: case ZYDIS_MNEMONIC_MOVNTDQ:
+     case ZYDIS_MNEMONIC_MOVAPS: case ZYDIS_MNEMONIC_MOVAPD: case ZYDIS_MNEMONIC_MOVUPS:
+     case ZYDIS_MNEMONIC_MOVUPD: case ZYDIS_MNEMONIC_MOVDQA: case ZYDIS_MNEMONIC_MOVDQU:
+       if (IsXmm(0)) {
+@@ -1696,6 +1699,18 @@ void InsnEmitter::EmitSse() {
              s.c_str(), va.c_str()));
        return;
      }
@@ -2330,7 +2340,7 @@ index f73425f..4bce368 100644
      case ZYDIS_MNEMONIC_RSQRTPS: {
        if (!IsXmm(0)) return Unimpl();
        std::string s = src(1);
-@@ -3118,7 +3130,8 @@ void Emitter::EmitX87Run(const Function& f, std::map<uint64_t, Insn>::const_iter
+@@ -3118,7 +3133,8 @@ void Emitter::EmitX87Run(const Function& f, std::map<uint64_t, Insn>::const_iter
    std::string dbody;
    std::vector<uint64_t> resume;
    bool doubles = false;
