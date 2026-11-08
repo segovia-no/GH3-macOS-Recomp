@@ -22,9 +22,11 @@ int main(int argc, char** argv) {
   game.video_memory_mb = 256;
   // The VC++ 2005 SP1 CRT (8.0.50727.6195, from Microsoft's redistributable),
   // lifted with the EXE; msvcp80 imports msvcr80, so msvcr80 comes first.
+  // FMOD Ex (UPX-unpacked fmodex.dll) imports msvcr80, so it follows it.
   game.lifted_dlls = {
       {.name = "msvcr80.dll", .static_import = true},
       {.name = "msvcp80.dll", .static_import = true},
+      {.name = "fmodex.dll", .static_import = true},
   };
   return recomp::RunProcess(game, exe, game_dir);
 }

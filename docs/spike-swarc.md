@@ -110,7 +110,11 @@ Ghidra 12.2 headless (about 10 min on this Mac): 20,049 functions (1,012 multi-c
 - [x] CRT: msvcr80/msvcp80 lifted as statically imported modules.
 - [x] AWL reimplemented natively (`recomp/src/awl.cpp`).
 - [x] GH3+ loader stub replaced (`recomp/src/plugins.cpp`).
-- [ ] Bink 1.9 frame-buffer API (next blocker).
+- [x] Bink 1.9 frame-buffer API; intro movies play.
+- [x] FMOD Ex lifted (CPU probes replaced), Winsock TCP, overlapped I/O, D3DX volume/PNG/JPEG/conversions.
+- [x] **Title screen, BetterGH3 online dialog and controller-help screen render** (Metal), 3-minute runs without a fatal.
+- [ ] Performance: Havok solver at -O0 is ~80% of the main thread (20-40 fps).
+- [ ] Input mapping (keyboard frets / guitar), audio verification, gameplay.
 
 ## First arm64 build and boot (observed)
 
@@ -166,7 +170,22 @@ Each line is the fatal stop after the previous fix. `tools/boot.sh`.
 | 4 | `awl.dll!Aspyr::Win::Init` (WinMain 0x40157c) | `recomp/src/awl.cpp`: all 20 AWL imports natively |
 | 5 | branch 0x4016de → 0x897d40 outside lifted code | SwARc PE loader maps raw data up to the aligned virtual size, as Windows does (the stub is in `.text`'s last page past VirtualSize); stub `replace`d by `recomp/src/plugins.cpp` |
 | 6 | `user32!SetWindowTextW` (window setup 0x57ba91) | SwARc user32: SetWindowTextW |
-| 7 | `binkw32!_BinkSetMemory@8` (0x5e0a29) | **open**: Bink 1.9 frame-buffer API |
+| 7 | `binkw32!_BinkSetMemory@8` (0x5e0a29) | SwARc binkw32: Bink 1.9 frame buffers (`BinkGetFrameBuffersInfo`/`RegisterFrameBuffers`, planes written straight from ffmpeg's YUV), SetMemory/SetIOSize/SetFrameRate/ControlBackgroundIO/ShouldSkip/GetError/OpenWaveOut |
+| 8 | `ws2_32!#21` (setsockopt) | SwARc ws2_32: connect, listen, accept, send, recv, getsockname, setsockopt, select, __WSAFDIsSet, WSAAsyncSelect (no notifications), gethostname, inet_addr, inet_ntoa, gethostbyname |
+| 9 | `fmodex!FMOD_System_Create` | Lift `fmodex.dll` (UPX-unpacked) as a static-import module; replace its 3 CPU probes so it takes C mixing paths (`recomp/fmodex.manifest`, `recomp/src/fmod_cpu.cpp`) |
+| 10 | branch into an FMOD switch case Ghidra missed | Lifter: merge its own jump-table recovery with Ghidra's partial tables (3 completed) |
+| 11 | `d3dx9!D3DXCreateVolumeTextureFromFileInMemoryEx` | SwARc d3d9: `IDirect3DVolumeTexture9` (guest-memory levels; no GPU 3D upload yet, shaders get gfx's dummy volume); D3DX loads volume DDS, and a 2D DDS as depth 1 like D3DX |
+| 12 | D3DX G16R16F → A8R8G8B8 | gfx: float formats in DecodePixel; D3DX: general format conversion |
+| 13 | `d3dx9!D3DXCreateCubeTextureFromFileInMemoryEx` | SwARc d3dx9 |
+| 14 | `ReadFile` with OVERLAPPED (loader thread) | SwARc kernel32: overlapped I/O completes synchronously (pread/pwrite, event set), GetOverlappedResult, CancelIo |
+| 15 | D3DX DXT1 → DXT2 | Lossless DXT1→DXT2/3 block transcoder |
+| 16 | `rcpss` in msvcr80 | Lifter + sse: RCPPS/RCPSS, correctly rounded, with an exhaustive test (`tests/x86/sse_rcp_test.cpp`) |
+| 17 | PNG texture | D3DX: PNG via `SDL_LoadPNG_IO` |
+| 18 | D3DX A8R8G8B8 → DXT5, DXT3 → DXT5 | D3DX: DXT1-5 block decoder + bounding-box DXT1/3/5 encoder; one decode→encode path for all conversions |
+| 19 | JPEG texture | D3DX: JPEG via ffmpeg's MJPEG decoder |
+| 20 | `iphlpapi!GetAdaptersInfo` | SwARc: no adapters (ERROR_NO_DATA) |
+| 21 | msvcr80 printf state machine switch (`push 7; pop ecx; cmp eax, ecx`) | Lifter: jump-table bounds held in a register (`mov reg, imm` / `push imm; pop reg`) |
+| — | none | **Runs 3+ minutes**: intro movies, title screen, menus (see below) |
 
 ### Lifting the CRT (observed)
 
@@ -187,3 +206,22 @@ Each line is the fatal stop after the previous fix. `tools/boot.sh`.
 
 - GH3 imports Bink 1.9's frame-buffer API (`BinkGetFrameBuffersInfo`, `BinkRegisterFrameBuffers`) and **no** `BinkCopyToBuffer`: it decodes into its own Y/cR/cB/A planes and converts YUV on the GPU. SwARc's binkw32 (ffmpeg) implements only the 1.x copy-to-buffer path. The plan is to extend it: ffmpeg's Bink decoder already outputs planar YUV (+alpha), which maps directly onto the frame-buffer planes. The `BINKFRAMEBUFFERS` layout must be confirmed against GH3's reads of it before relying on it.
 - Lifting the real `binkw32.dll` instead is unlikely to work: its decoder is MMX-heavy, and the lifter lacks MMX (see the unimplemented `punpckhdq`/`psllq` sites).
+
+## Running state (observed)
+
+- Boot to intro movies (Activision, RedOctane, Neversoft, intro) via Bink frame buffers + GH3's YUV shader on Metal, then the title screen ("PRESS ANY BUTTON TO ROCK"), then BetterGH3's menus. `docs/screenshots/intro-movie.png`.
+- BetterGH3's QB patches run unchanged (its custom "Try allowing Guitar Hero III through Firewall" online string appears).
+- Online: with `AutoLogin=PROMPT` (default) the game asks to log in and, offline, ends on the online error dialog. `AutoLogin=OFF` in `~/Library/Application Support/gh3/AspyrConfig.ini` (values PROMPT/ON/OFF, strings in GH3.exe) skips it; the game then shows the controller help screen ("In the event of rock", continue = green).
+- Input: test input (`GH3_TEST_INPUT`) keys reach the game (Return starts/skips). The keyboard fret mapping is not worked out yet (F1 did not act as green); XDinput/guitar input is the next input task.
+- Intermittent: one host SIGSEGV right after Direct3DCreate9 in ~1 of 5 boots (the crash reporter faulted while unwinding); not reproduced since. To investigate.
+- Audio: SwARc's DirectSound module is now linked (FMOD could not load dsound.dll before); output not yet verified by ear. Bink movie audio reports "0 playing" (GH3 sets no Bink sound system).
+
+## Performance (observed)
+
+`sample` on the running game (`work/prof*.txt`): ~80% of the main thread is Havok's world step, game loop 0x484310 → 0x525840 → 0x6E5F40 → … → constraint solver 0x70F440 → **0x80C0A0** and **0x7FD500** (strings `MiNumJacobians` etc.). These are the two huge straight-line x87 functions built at -O0 (above). `Options.Physics=0` does not stop the step. Next: SoftFloat SSE (`sse::Arith`) and per-pixel texture conversion on upload (`gfx::DecodePixel`).
+
+- fps: ~40 in early menus/movies before the solver became active; ~20-23 once it runs.
+- Options, in order of payoff:
+  1. **Native replacements of the solver functions** (`replace 0080c0a0` / `007fd500`): SwARc's intended workflow; the lifted body stays as reference. Havok 4.x solver code; write from the decompilation (`work/giant_decomp.c`), verify against the lifted body.
+  2. Make clang finish at -O1/-O2 on them: the x87 runs emit a fast host-double path plus an exact fallback for every instruction, so the CFG is huge. Try `-ftime-trace` to find the pass, or a lifter option to split giant functions.
+  3. Upload L8/other formats without per-pixel CPU conversion where SDL_GPU has a native format.

@@ -1,3 +1,19 @@
+diff --git a/platforms/win32/CMakeLists.txt b/platforms/win32/CMakeLists.txt
+index 98ce806..0179bf5 100644
+--- a/platforms/win32/CMakeLists.txt
++++ b/platforms/win32/CMakeLists.txt
+@@ -88,6 +88,11 @@ target_link_libraries(recomp_d3d9 PUBLIC recomp_win32 recomp_gfx recomp_hlsl)
+ # D3DX's maths rounds like the original only without contraction into FMA.
+ set_source_files_properties(src/win32/d3dx9.cpp TARGET_DIRECTORY recomp_d3d9
+   PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
++# JPEG textures (D3DX) decode with ffmpeg's MJPEG decoder when it is there.
++if(FFMPEG_FOUND)
++  target_link_libraries(recomp_d3d9 PRIVATE PkgConfig::FFMPEG)
++  target_compile_definitions(recomp_d3d9 PRIVATE RECOMP_D3DX_JPEG=1)
++endif()
+ 
+ # OpenGL 1.x (opengl32, wgl, gdi32 pixel formats) over gfx::Device.
+ add_library(recomp_opengl SHARED
 diff --git a/platforms/win32/lifter/pe_reader.cpp b/platforms/win32/lifter/pe_reader.cpp
 index 5e5d480..e6dfe6b 100644
 --- a/platforms/win32/lifter/pe_reader.cpp
@@ -58,6 +74,993 @@ index 2b4ea5b..69e9522 100644
  // ---- ole32 ------------------------------------------------------------------
  
  HLE("ole32.dll", CoInitialize, 1) { return 0; }  // S_OK
+diff --git a/platforms/win32/src/win32/binkw32.cpp b/platforms/win32/src/win32/binkw32.cpp
+index 907ecda..1a16364 100644
+--- a/platforms/win32/src/win32/binkw32.cpp
++++ b/platforms/win32/src/win32/binkw32.cpp
+@@ -13,6 +13,12 @@
+ // The BINK struct is a guest block: games read Width, Height, Frames
+ // (+0x08), FrameNum (+0x0C) and, in 1.8, NumTracks (+0xD0) and the track
+ // ID list (+0x250) directly.
++//
++// Frame buffers (1.9): instead of BinkCopyToBuffer, a game may ask for the
++// plane sizes (BinkGetFrameBuffersInfo), allocate the Y/cR/cB/A planes
++// itself (typically locked textures, YUV converted on the GPU) and hand
++// them over (BinkRegisterFrameBuffers). BinkDoFrame then writes each
++// decoded frame's planes into the next frame set and sets FrameNum to it.
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -62,8 +68,18 @@ struct Track {
+   float volume = 1.0f;
+ };
+ 
++// BINKFRAMEBUFFERS (bink.h, 1.9): a header, then BINKMAXFRAMEBUFFERS (2)
++// frame sets of four planes {Allocate, Buffer, BufferPitch}: Y, cR, cB, A.
++enum : uint32_t {
++  kFbTotalFrames = 0x00, kFbYAWidth = 0x04, kFbYAHeight = 0x08,
++  kFbCWidth = 0x0C, kFbCHeight = 0x10, kFbFrameNum = 0x14, kFbFrames = 0x18,
++  kFbSetSize = 0x30, kFbPlaneSize = 0x0C, kFbMaxFrames = 2,
++};
++enum FbPlane : uint32_t { kPlaneY = 0, kPlaneCr = 1, kPlaneCb = 2, kPlaneA = 3 };
++
+ struct Movie {
+   uint32_t guest = 0;
++  uint32_t fbufs = 0;  // BinkRegisterFrameBuffers: the game's planes, or 0
+   std::vector<uint8_t> data;
+   int64_t pos = 0;
+   AVFormatContext* fmt = nullptr;
+@@ -192,7 +208,70 @@ void QueueAudio(Movie& m, Track& t, AVFrame* f) {
+   t.queue->Push(buf.data(), f->nb_samples);
+ }
+ 
++// Copies `rows` rows of `bytes` from src into the guest plane `plane` of
++// frame set `set`, if the game gave it a buffer. The plane's padding (it
++// is `alloc_w` x `alloc_h`, 16-aligned) is filled with `pad`: black in
++// YUV is Y 0, cR/cB 128 (zero chroma bytes would show as green).
++void CopyPlane(uint32_t fb, uint32_t set, FbPlane plane, const uint8_t* src,
++               int src_stride, int bytes, int rows, int alloc_w, int alloc_h, uint8_t pad) {
++  uint32_t p = fb + kFbFrames + set * kFbSetSize + uint32_t(plane) * kFbPlaneSize;
++  uint32_t buf = Rd32(p + 4), pitch = Rd32(p + 8);
++  if (!buf || !src) return;
++  int width = std::min<int>(alloc_w, int(pitch));
++  bytes = std::min<int>(bytes, width);
++  for (int y = 0; y < rows; y++) {
++    uint8_t* row = static_cast<uint8_t*>(GPtr(buf + uint32_t(y) * pitch));
++    std::memcpy(row, src + ptrdiff_t(y) * src_stride, size_t(bytes));
++    if (width > bytes) std::memset(row + bytes, pad, size_t(width - bytes));
++  }
++  for (int y = rows; y < alloc_h; y++)
++    std::memset(GPtr(buf + uint32_t(y) * pitch), pad, size_t(width));
++}
++
++// Frame buffer mode: the decoded frame's planes into the next frame set.
++// ffmpeg's Bink decoder gives YUV420P (YUVA420P with alpha); anything else
++// is converted. cR is V (data[2]), cB is U (data[1]).
++void WriteFrameBuffers(Movie& m) {
++  AVFrame* f = m.frame;
++  AVFrame* src = f;
++  AVFrame* conv = nullptr;
++  bool alpha = f->format == AV_PIX_FMT_YUVA420P;
++  if (f->format != AV_PIX_FMT_YUV420P && !alpha) {
++    conv = av_frame_alloc();
++    conv->format = AV_PIX_FMT_YUVA420P;
++    conv->width = f->width;
++    conv->height = f->height;
++    if (av_frame_get_buffer(conv, 0) < 0) {
++      av_frame_free(&conv);
++      return;
++    }
++    m.sws = sws_getCachedContext(m.sws, f->width, f->height, AVPixelFormat(f->format),
++                                 f->width, f->height, AV_PIX_FMT_YUVA420P, SWS_POINT,
++                                 nullptr, nullptr, nullptr);
++    if (!m.sws) {
++      av_frame_free(&conv);
++      return;
++    }
++    sws_scale(m.sws, f->data, f->linesize, 0, f->height, conv->data, conv->linesize);
++    src = conv;
++    alpha = true;
++  }
++  uint32_t fb = m.fbufs;
++  uint32_t total = std::clamp<uint32_t>(Rd32(fb + kFbTotalFrames), 1, kFbMaxFrames);
++  uint32_t set = (Rd32(fb + kFbFrameNum) + 1) % total;
++  int w = src->width, h = src->height, cw = (w + 1) / 2, ch = (h + 1) / 2;
++  int yaw = int(Rd32(fb + kFbYAWidth)), yah = int(Rd32(fb + kFbYAHeight));
++  int caw = int(Rd32(fb + kFbCWidth)), cah = int(Rd32(fb + kFbCHeight));
++  CopyPlane(fb, set, kPlaneY, src->data[0], src->linesize[0], w, h, yaw, yah, 0);
++  CopyPlane(fb, set, kPlaneCr, src->data[2], src->linesize[2], cw, ch, caw, cah, 128);
++  CopyPlane(fb, set, kPlaneCb, src->data[1], src->linesize[1], cw, ch, caw, cah, 128);
++  if (alpha) CopyPlane(fb, set, kPlaneA, src->data[3], src->linesize[3], w, h, yaw, yah, 0);
++  Wr32(fb + kFbFrameNum, set);
++  av_frame_free(&conv);
++}
++
+ void ConvertVideo(Movie& m) {
++  if (m.fbufs) return WriteFrameBuffers(m);
+   AVFrame* f = m.frame;
+   m.sws = sws_getCachedContext(m.sws, f->width, f->height, AVPixelFormat(f->format),
+                                m.w, m.h, AV_PIX_FMT_BGRA, SWS_POINT, nullptr,
+@@ -258,7 +337,8 @@ HLE_NAMED("binkw32.dll", "_BinkSetSoundSystem@8", BinkSetSoundSystem, 2) {
+   std::lock_guard<std::mutex> l(g_mu);
+   uint32_t open = Arg(c, 0);
+   g_sound_system = !open ? SoundSystem::None
+-                   : open == ThunkFor("binkw32.dll", "_BinkOpenDirectSound@4")
++                   : open == ThunkFor("binkw32.dll", "_BinkOpenDirectSound@4") ||
++                           open == ThunkFor("binkw32.dll", "_BinkOpenWaveOut@4")
+                        ? SoundSystem::DirectSound
+                        : SoundSystem::Miles;
+   return 1;
+@@ -291,6 +371,38 @@ HLE_NAMED("binkw32.dll", "_BinkOpenMiles@4", BinkOpenMiles, 1) {
+ HLE_NAMED("binkw32.dll", "_BinkOpenDirectSound@4", BinkOpenDirectSound, 1) {
+   FatalF("binkw32: BinkOpenDirectSound called directly");
+ }
++// waveOut plays through the mixer like DirectSound (BinkSetSoundSystem).
++HLE_NAMED("binkw32.dll", "_BinkOpenWaveOut@4", BinkOpenWaveOut, 1) {
++  FatalF("binkw32: BinkOpenWaveOut called directly");
++}
++
++// BinkSetMemory(alloc, free): Bink's own allocations do not live in guest
++// memory here, so the game's allocator is not needed.
++HLE_NAMED("binkw32.dll", "_BinkSetMemory@8", BinkSetMemory, 2) { return 0; }
++
++// BinkSetIOSize(bytes): the read buffer of the next BinkOpen; movies are
++// read whole.
++HLE_NAMED("binkw32.dll", "_BinkSetIOSize@4", BinkSetIOSize, 1) { return 0; }
++
++// BinkSetFrameRate(rate, div): the frame rate the next BinkOpen uses with
++// BINKFRAMERATE. Movies play at their own rate.
++HLE_NAMED("binkw32.dll", "_BinkSetFrameRate@8", BinkSetFrameRate, 2) { return 0; }
++
++// BinkControlBackgroundIO(HBINK, control): suspends/resumes Bink's reader
++// thread, which does not exist here. Returns 0.
++HLE_NAMED("binkw32.dll", "_BinkControlBackgroundIO@8", BinkControlBackgroundIO, 2) {
++  return 0;
++}
++
++// BinkShouldSkip(HBINK): whether the game should skip showing this frame
++// to catch up. Frames are decoded on demand, so never.
++HLE_NAMED("binkw32.dll", "_BinkShouldSkip@4", BinkShouldSkip, 1) { return 0; }
++
++// BinkGetError() -> the last error message, "" here.
++HLE_NAMED("binkw32.dll", "_BinkGetError@0", BinkGetError, 0) {
++  static gaddr empty = HeapAllocProcess(1, true);
++  return empty;
++}
+ 
+ // The audio track IDs of a Bink file (header: track count at 0x28, from
+ // revision 'k' on 4 more bytes, then per track 4 bytes, 4 bytes of rate and
+@@ -450,6 +562,37 @@ HLE_NAMED("binkw32.dll", "_BinkWait@4", BinkWait, 1) {
+   return now < due ? 1 : 0;
+ }
+ 
++// BinkGetFrameBuffersInfo(HBINK, BINKFRAMEBUFFERS*): plane sizes (16-pixel
++// aligned) and which planes to allocate; the game fills in the buffers.
++HLE_NAMED("binkw32.dll", "_BinkGetFrameBuffersInfo@8", BinkGetFrameBuffersInfo, 2) {
++  std::lock_guard<std::mutex> l(g_mu);
++  Movie* m = Find(Arg(c, 0), "BinkGetFrameBuffersInfo");
++  uint32_t fb = Arg(c, 1);
++  if (!m || !fb) return 0;
++  std::memset(GPtr(fb), 0, kFbFrames + kFbMaxFrames * kFbSetSize);
++  auto align16 = [](int v) { return uint32_t((v + 15) & ~15); };
++  Wr32(fb + kFbTotalFrames, kFbMaxFrames);
++  Wr32(fb + kFbYAWidth, align16(m->w));
++  Wr32(fb + kFbYAHeight, align16(m->h));
++  Wr32(fb + kFbCWidth, align16((m->w + 1) / 2));
++  Wr32(fb + kFbCHeight, align16((m->h + 1) / 2));
++  Wr32(fb + kFbFrameNum, kFbMaxFrames - 1);  // the first frame goes to set 0
++  bool alpha = m->vdec && m->vdec->pix_fmt == AV_PIX_FMT_YUVA420P;
++  for (uint32_t s = 0; s < kFbMaxFrames; s++)
++    for (uint32_t p = 0; p < 4; p++)
++      Wr32(fb + kFbFrames + s * kFbSetSize + p * kFbPlaneSize, p != kPlaneA || alpha);
++  return 0;
++}
++
++// BinkRegisterFrameBuffers(HBINK, BINKFRAMEBUFFERS*): from now on frames
++// are decoded into the game's planes. The game may change the buffers
++// (e.g. relock textures) before each BinkDoFrame; they are read then.
++HLE_NAMED("binkw32.dll", "_BinkRegisterFrameBuffers@8", BinkRegisterFrameBuffers, 2) {
++  std::lock_guard<std::mutex> l(g_mu);
++  if (Movie* m = Find(Arg(c, 0), "BinkRegisterFrameBuffers")) m->fbufs = Arg(c, 1);
++  return 0;
++}
++
+ // BinkDoFrame(HBINK): decodes the frame FrameNum.
+ HLE_NAMED("binkw32.dll", "_BinkDoFrame@4", BinkDoFrame, 1) {
+   std::lock_guard<std::mutex> l(g_mu);
+diff --git a/platforms/win32/src/win32/d3d9_impl.h b/platforms/win32/src/win32/d3d9_impl.h
+index 2b04aeb..38e241c 100644
+--- a/platforms/win32/src/win32/d3d9_impl.h
++++ b/platforms/win32/src/win32/d3d9_impl.h
+@@ -122,6 +122,22 @@ struct Texture : com::Object {
+   ~Texture() override;
+ };
+ 
++// IDirect3DVolumeTexture9: levels of width x height x depth texels, kept
++// in guest memory only. There is no gfx 3D texture yet: draws see none
++// bound (shaders sampling a sampler3D get gfx's dummy volume).
++struct VolumeTexture : com::Object {
++  uint32_t device = 0;
++  uint32_t width = 0, height = 0, depth = 0, levels = 0, usage = 0, format = 0, pool = 0;
++  gfx::Format fmt = gfx::Format::Unknown;
++  struct Level {
++    uint32_t w = 0, h = 0, d = 0, row_pitch = 0, slice_pitch = 0;
++    uint32_t mem = 0;  // allocated on first lock or fill
++  };
++  std::vector<Level> lv;
++  uint32_t lod = 0, priority = 0, autogen_filter = 2;  // D3DTEXF_LINEAR
++  ~VolumeTexture() override;
++};
++
+ struct Buffer : com::Object {
+   uint32_t device = 0;
+   bool index = false;
+@@ -222,6 +238,16 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t
+                     uint32_t levels, uint32_t usage, uint32_t fmt, uint32_t pool,
+                     uint32_t* out);
+ 
++// CreateVolumeTexture: the HRESULT; the new texture's guest pointer in *out.
++uint32_t NewVolumeTexture(Device& d, uint32_t device, uint32_t w, uint32_t h, uint32_t depth,
++                          uint32_t levels, uint32_t usage, uint32_t fmt, uint32_t pool,
++                          uint32_t* out);
++
++// Replaces a whole volume level (slices of `slice_pitch`, rows of `pitch`
++// bytes, in the texture's format): D3DX loaders.
++void FillVolumeLevel(VolumeTexture& t, uint32_t level, const uint8_t* src, uint32_t pitch,
++                     uint32_t slice_pitch);
++
+ // D3DXCompileShader's output: a shader function holding the HLSL
+ // translation instead of shader model bytecode. Version token, one comment
+ // with kTranslatedTag and the serialised hlsl::Program, END. Create*Shader
+diff --git a/platforms/win32/src/win32/d3d9_resource.cpp b/platforms/win32/src/win32/d3d9_resource.cpp
+index 88f7db7..25c543b 100644
+--- a/platforms/win32/src/win32/d3d9_resource.cpp
++++ b/platforms/win32/src/win32/d3d9_resource.cpp
+@@ -28,6 +28,7 @@ constexpr GUID kIID_IDirect3DResource9 = {0x05EEC05D, 0x8F7D, 0x4362, {0xB9, 0x9
+ constexpr GUID kIID_IDirect3DSurface9 = {0x0CFBAF3A, 0x9FF6, 0x429A, {0x99, 0xB3, 0xA2, 0x79, 0x6A, 0xF8, 0xB8, 0x9B}};
+ constexpr GUID kIID_IDirect3DBaseTexture9 = {0x580CA87E, 0x1D3C, 0x4D54, {0x99, 0x1D, 0xB7, 0xD3, 0xE3, 0xC2, 0x98, 0xCE}};
+ constexpr GUID kIID_IDirect3DTexture9 = {0x85C31227, 0x3DE5, 0x4F00, {0x9B, 0x3A, 0xF1, 0x1A, 0xC3, 0x8C, 0x18, 0xB5}};
++constexpr GUID kIID_IDirect3DVolumeTexture9 = {0x2518526C, 0xE789, 0x4111, {0xA7, 0xB9, 0x47, 0xEF, 0x32, 0x8D, 0x13, 0xE6}};
+ constexpr GUID kIID_IDirect3DCubeTexture9 = {0xFFF32F81, 0xD953, 0x473A, {0x92, 0x23, 0x93, 0xD6, 0x52, 0xAB, 0xA9, 0x3F}};
+ constexpr GUID kIID_IDirect3DVertexBuffer9 = {0xB64BB1B5, 0xFD70, 0x4DF6, {0xBF, 0x91, 0x19, 0xD0, 0xA1, 0x24, 0x55, 0xE3}};
+ constexpr GUID kIID_IDirect3DIndexBuffer9 = {0x7C9DD65E, 0xD3F7, 0x4529, {0xAC, 0xEE, 0x78, 0x58, 0x30, 0xAC, 0xDE, 0x35}};
+@@ -67,6 +68,16 @@ uint32_t CubeTextureVtable() {
+        "AddDirtyRect"});
+ }
+ 
++uint32_t VolumeTextureVtable() {
++  return com::Vtable(
++      "d3d9.dll", "IDirect3DVolumeTexture9",
++      {"QueryInterface", "AddRef", "Release", "GetDevice", "SetPrivateData",
++       "GetPrivateData", "FreePrivateData", "SetPriority", "GetPriority",
++       "PreLoad", "GetType", "SetLOD", "GetLOD", "GetLevelCount",
++       "SetAutoGenFilterType", "GetAutoGenFilterType", "GenerateMipSubLevels",
++       "GetLevelDesc", "GetVolumeLevel", "LockBox", "UnlockBox", "AddDirtyBox"});
++}
++
+ uint32_t BufferVtable(bool index) {
+   return com::Vtable(
+       "d3d9.dll", index ? "IDirect3DIndexBuffer9" : "IDirect3DVertexBuffer9",
+@@ -103,6 +114,7 @@ T* Obj(Ctx& c, const char* iface) {
+ 
+ Surface* Surf(Ctx& c) { return Obj<Surface>(c, "IDirect3DSurface9"); }
+ Texture* Tex(Ctx& c) { return Obj<Texture>(c, "IDirect3D{Cube}Texture9"); }
++VolumeTexture* VolTex(Ctx& c) { return Obj<VolumeTexture>(c, "IDirect3DVolumeTexture9"); }
+ Buffer* Buf(Ctx& c) { return Obj<Buffer>(c, "IDirect3D{Vertex,Index}Buffer9"); }
+ 
+ uint32_t GetDeviceOf(Ctx& c, uint32_t device) {
+@@ -252,6 +264,11 @@ Shader::~Shader() {
+   if (d && id) d->gfx->DestroyShader(id);
+ }
+ 
++VolumeTexture::~VolumeTexture() {
++  for (Level& l : lv)
++    if (l.mem) HeapFreeProcess(l.mem);
++}
++
+ Texture::~Texture() {
+   Device* d = com::As<Device>(device);
+   if (d && tex) d->gfx->DestroyTexture(tex);
+@@ -311,6 +328,57 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t
+   return D3D_OK;
+ }
+ 
++uint32_t NewVolumeTexture(Device& d, uint32_t device, uint32_t w, uint32_t h, uint32_t depth,
++                          uint32_t levels, uint32_t usage, uint32_t fmt, uint32_t pool,
++                          uint32_t* out) {
++  (void)d;
++  *out = 0;
++  gfx::Format f = FormatFromD3D(fmt);
++  if (!w || !h || !depth || f == gfx::Format::Unknown || IsDepthFormat(f) ||
++      (usage & D3DUSAGE_RENDERTARGET)) {
++    WarnF("d3d9: CreateVolumeTexture %ux%ux%u fmt %X usage %X pool %u: not supported\n", w,
++          h, depth, fmt, usage, pool);
++    return D3DERR_INVALIDCALL;
++  }
++  uint32_t full = 1;
++  for (uint32_t s = std::max({w, h, depth}); s > 1; s >>= 1) full++;
++  if (!levels || levels > full) levels = full;
++  auto t = std::make_shared<VolumeTexture>();
++  t->device = device;
++  t->width = w;
++  t->height = h;
++  t->depth = depth;
++  t->levels = levels;
++  t->usage = usage;
++  t->format = fmt;
++  t->pool = pool;
++  t->fmt = f;
++  for (uint32_t i = 0; i < levels; i++) {
++    VolumeTexture::Level l;
++    l.w = std::max(1u, w >> i);
++    l.h = std::max(1u, h >> i);
++    l.d = std::max(1u, depth >> i);
++    l.row_pitch = gfx::RowPitch(f, l.w);
++    l.slice_pitch = l.row_pitch * gfx::RowCount(f, l.h);
++    t->lv.push_back(l);
++  }
++  *out = com::Publish(t, VolumeTextureVtable());
++  RECOMP_TRACE("  CreateVolumeTexture %ux%ux%u x%u fmt %X usage %X pool %u -> %08X\n", w, h,
++               depth, levels, fmt, usage, pool, *out);
++  return D3D_OK;
++}
++
++void FillVolumeLevel(VolumeTexture& t, uint32_t level, const uint8_t* src, uint32_t pitch,
++                     uint32_t slice_pitch) {
++  VolumeTexture::Level& l = t.lv[level];
++  if (!l.mem) l.mem = HeapAllocProcess(l.slice_pitch * l.d, true);
++  uint32_t row = gfx::RowPitch(t.fmt, l.w), rows = gfx::RowCount(t.fmt, l.h);
++  for (uint32_t z = 0; z < l.d; z++)
++    for (uint32_t y = 0; y < rows; y++)
++      std::memcpy(GPtr(l.mem + z * l.slice_pitch + y * l.row_pitch),
++                  src + size_t(z) * slice_pitch + size_t(y) * pitch, row);
++}
++
+ void FillLevel(Texture& t, uint32_t face, uint32_t level, const uint8_t* src,
+                uint32_t pitch) {
+   Texture::Level& l = t.At(face, level);
+@@ -387,6 +455,16 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreateTexture", D3DDev9_CreateTexture,
+   return hr;
+ }
+ 
++// (Width, Height, Depth, Levels, Usage, Format, Pool, ppVolumeTexture,
++// pSharedHandle)
++HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreateVolumeTexture", D3DDev9_CreateVolumeTexture, 10) {
++  uint32_t out;
++  uint32_t hr = NewVolumeTexture(*Dev(c), Arg(c, 0), Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4),
++                                 Arg(c, 5), Arg(c, 6), Arg(c, 7), &out);
++  Wr32(Arg(c, 8), out);
++  return hr;
++}
++
+ // (EdgeLength, Levels, Usage, Format, Pool, ppCubeTexture, pSharedHandle)
+ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreateCubeTexture", D3DDev9_CreateCubeTexture, 8) {
+   uint32_t out;
+@@ -906,6 +984,82 @@ HLE_NAMED("d3d9.dll", "IDirect3DCubeTexture9::UnlockRect", D3DCube9_UnlockRect,
+ 
+ HLE_NAMED("d3d9.dll", "IDirect3DCubeTexture9::AddDirtyRect", D3DCube9_AddDirtyRect, 3) { return D3D_OK; }
+ 
++// ---- IDirect3DVolumeTexture9 -----------------------------------------------------------
++
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::QueryInterface", D3DVol9_QueryInterface, 3) {
++  if (com::GuidEq(Arg(c, 1), kIID_IDirect3DBaseTexture9) ||
++      com::GuidEq(Arg(c, 1), kIID_IDirect3DResource9)) {
++    com::AddRef(Arg(c, 0));
++    Wr32(Arg(c, 2), Arg(c, 0));
++    return D3D_OK;
++  }
++  return QueryInterfaceFor(c, kIID_IDirect3DVolumeTexture9);
++}
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::AddRef", D3DVol9_AddRef, 1) { return com::AddRef(Arg(c, 0)); }
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::Release", D3DVol9_Release, 1) { return com::Release(Arg(c, 0)); }
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetDevice", D3DVol9_GetDevice, 2) { return GetDeviceOf(c, VolTex(c)->device); }
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetType", D3DVol9_GetType, 1) { return D3DRTYPE_VOLUMETEXTURE; }
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::PreLoad", D3DVol9_PreLoad, 1) { return 0; }
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetLevelCount", D3DVol9_GetLevelCount, 1) { return VolTex(c)->levels; }
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::SetPriority", D3DVol9_SetPriority, 2) {
++  VolumeTexture* t = VolTex(c);
++  uint32_t old = t->priority;
++  t->priority = Arg(c, 1);
++  return old;
++}
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetPriority", D3DVol9_GetPriority, 1) { return VolTex(c)->priority; }
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::SetLOD", D3DVol9_SetLOD, 2) {
++  VolumeTexture* t = VolTex(c);
++  uint32_t old = t->lod;
++  if (t->pool == D3DPOOL_MANAGED) t->lod = std::min(uint32_t(Arg(c, 1)), t->levels - 1);
++  return old;
++}
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetLOD", D3DVol9_GetLOD, 1) { return VolTex(c)->lod; }
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::SetAutoGenFilterType", D3DVol9_SetAutoGenFilterType, 2) {
++  VolTex(c)->autogen_filter = Arg(c, 1);
++  return D3D_OK;
++}
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetAutoGenFilterType", D3DVol9_GetAutoGenFilterType, 1) {
++  return VolTex(c)->autogen_filter;
++}
++
++// (Level, pDesc): D3DVOLUME_DESC {Format, Type, Usage, Pool, Width, Height,
++// Depth}.
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetLevelDesc", D3DVol9_GetLevelDesc, 3) {
++  VolumeTexture* t = VolTex(c);
++  uint32_t level = Arg(c, 1), out = Arg(c, 2);
++  if (level >= t->levels) return D3DERR_INVALIDCALL;
++  const VolumeTexture::Level& l = t->lv[level];
++  const uint32_t desc[7] = {t->format, 3 /* D3DRTYPE_VOLUME */, t->usage, t->pool, l.w, l.h, l.d};
++  std::memcpy(GPtr(out), desc, sizeof desc);
++  return D3D_OK;
++}
++
++// (Level, pLockedVolume, pBox, Flags): D3DLOCKED_BOX {RowPitch,
++// SlicePitch, pBits}; D3DBOX {Left, Top, Right, Bottom, Front, Back}.
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::LockBox", D3DVol9_LockBox, 5) {
++  VolumeTexture* t = VolTex(c);
++  uint32_t level = Arg(c, 1), out = Arg(c, 2), box = Arg(c, 3);
++  if (level >= t->levels) return D3DERR_INVALIDCALL;
++  VolumeTexture::Level& l = t->lv[level];
++  if (!l.mem) l.mem = HeapAllocProcess(l.slice_pitch * l.d, true);
++  uint32_t off = 0;
++  if (box) {
++    uint32_t left = Rd32(box), top = Rd32(box + 4), front = Rd32(box + 16);
++    off = front * l.slice_pitch +
++          (gfx::IsCompressed(t->fmt)
++               ? (top / 4) * l.row_pitch + (left / 4) * gfx::RowPitch(t->fmt, 4)
++               : top * l.row_pitch + left * gfx::BitsPerPixel(t->fmt) / 8);
++  }
++  Wr32(out, l.row_pitch);
++  Wr32(out + 4, l.slice_pitch);
++  Wr32(out + 8, l.mem + off);
++  return D3D_OK;
++}
++
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::UnlockBox", D3DVol9_UnlockBox, 2) { return D3D_OK; }
++HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::AddDirtyBox", D3DVol9_AddDirtyBox, 2) { return D3D_OK; }
++
+ // ---- IDirect3DVertexBuffer9 / IDirect3DIndexBuffer9 ------------------------------------
+ 
+ uint32_t BufferQueryInterface(Ctx& c) {
+diff --git a/platforms/win32/src/win32/d3dx9.cpp b/platforms/win32/src/win32/d3dx9.cpp
+index 62cb420..c57faef 100644
+--- a/platforms/win32/src/win32/d3dx9.cpp
++++ b/platforms/win32/src/win32/d3dx9.cpp
+@@ -1,7 +1,8 @@
+ // d3dx9_35: the D3DX 9 functions games import, on the d3d9 HLE.
+ //
+ // Textures from files in memory: DDS (2D and cube; DXT1-5, the common RGB,
+-// luminance and alpha layouts, and D3DFORMAT FourCCs). Missing mip levels
++// luminance and alpha layouts, and D3DFORMAT FourCCs), PNG (through SDL)
++// and JPEG (through ffmpeg, when built with it), both as A8R8G8B8. Missing mip levels
+ // are generated with a box filter for uncompressed formats. Anything
+ // else (other image formats, resizing, format conversion) is fatal and
+ // named, to be added when a game needs it.
+@@ -11,6 +12,15 @@
+ // (d3d9::TranslatedFunction), with an ID3DXConstantTable of the registers
+ // the translation placed the uniforms in.
+ 
++#include <SDL3/SDL.h>
++
++#if RECOMP_D3DX_JPEG
++extern "C" {
++#include <libavcodec/avcodec.h>
++#include <libswscale/swscale.h>
++}
++#endif
++
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
+@@ -35,7 +45,7 @@ constexpr uint32_t D3DX_DEFAULT_NONPOW2 = 0xFFFFFFFE;
+ constexpr uint32_t D3DX_FROM_FILE = 0xFFFFFFFD;
+ constexpr uint32_t D3DFMT_FROM_FILE = 0xFFFFFFFD;
+ constexpr uint32_t D3DXERR_INVALIDDATA = 0x88760B59;
+-constexpr uint32_t D3DXIFF_DDS = 4;
++constexpr uint32_t D3DXIFF_JPG = 1, D3DXIFF_PNG = 3, D3DXIFF_DDS = 4;
+ 
+ struct D3DXIMAGE_INFO {
+   uint32_t Width, Height, Depth, MipLevels, Format, ResourceType, ImageFileFormat;
+@@ -145,6 +155,80 @@ bool ParseDds(const uint8_t* p, uint32_t size, Image* img, std::string* why) {
+   return true;
+ }
+ 
++// Decodes a PNG into A8R8G8B8 pixels (stored in *pixels); false if it is
++// not one SDL reads.
++bool ParsePng(const uint8_t* p, uint32_t size, Image* img, std::vector<uint8_t>* pixels) {
++  static const uint8_t kSig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
++  if (size < 8 || std::memcmp(p, kSig, 8) != 0) return false;
++  SDL_Surface* s = SDL_LoadPNG_IO(SDL_IOFromConstMem(p, size), true);
++  if (!s) return false;
++  // ARGB8888 is B, G, R, A in memory: D3DFMT_A8R8G8B8.
++  SDL_Surface* argb = SDL_ConvertSurface(s, SDL_PIXELFORMAT_ARGB8888);
++  SDL_DestroySurface(s);
++  if (!argb) return false;
++  img->width = uint32_t(argb->w);
++  img->height = uint32_t(argb->h);
++  img->levels = 1;
++  img->format = D3DFMT_A8R8G8B8;
++  img->cube = false;
++  pixels->resize(size_t(img->width) * img->height * 4);
++  for (uint32_t y = 0; y < img->height; y++)
++    std::memcpy(pixels->data() + size_t(y) * img->width * 4,
++                static_cast<const uint8_t*>(argb->pixels) + size_t(y) * argb->pitch,
++                size_t(img->width) * 4);
++  SDL_DestroySurface(argb);
++  img->data = pixels->data();
++  img->size = uint32_t(pixels->size());
++  return true;
++}
++
++// Decodes a JPEG into A8R8G8B8 pixels (stored in *pixels); false if it is
++// not one, or there is no decoder in this build.
++bool ParseJpeg(const uint8_t* p, uint32_t size, Image* img, std::vector<uint8_t>* pixels) {
++  if (size < 4 || p[0] != 0xFF || p[1] != 0xD8 || p[2] != 0xFF) return false;
++#if RECOMP_D3DX_JPEG
++  const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
++  AVCodecContext* ctx = codec ? avcodec_alloc_context3(codec) : nullptr;
++  AVPacket* pkt = av_packet_alloc();
++  AVFrame* frame = av_frame_alloc();
++  bool ok = false;
++  if (ctx && pkt && frame && avcodec_open2(ctx, codec, nullptr) == 0 &&
++      av_new_packet(pkt, int(size)) == 0) {
++    std::memcpy(pkt->data, p, size);
++    if (avcodec_send_packet(ctx, pkt) == 0 && avcodec_send_packet(ctx, nullptr) >= 0 &&
++        avcodec_receive_frame(ctx, frame) == 0) {
++      SwsContext* sws = sws_getContext(frame->width, frame->height,
++                                       AVPixelFormat(frame->format), frame->width,
++                                       frame->height, AV_PIX_FMT_BGRA, SWS_POINT, nullptr,
++                                       nullptr, nullptr);
++      if (sws) {
++        img->width = uint32_t(frame->width);
++        img->height = uint32_t(frame->height);
++        img->levels = 1;
++        img->format = D3DFMT_A8R8G8B8;
++        img->cube = false;
++        pixels->resize(size_t(img->width) * img->height * 4);
++        uint8_t* dst[4] = {pixels->data()};
++        int stride[4] = {int(img->width) * 4};
++        sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst, stride);
++        sws_freeContext(sws);
++        img->data = pixels->data();
++        img->size = uint32_t(pixels->size());
++        ok = true;
++      }
++    }
++  }
++  av_frame_free(&frame);
++  av_packet_free(&pkt);
++  avcodec_free_context(&ctx);
++  return ok;
++#else
++  (void)img;
++  (void)pixels;
++  return false;
++#endif
++}
++
+ // The next mip level of an uncompressed image: each pixel the average of
+ // the 2x2 (or 2x1 / 1x2 at the edges of odd sizes) block above it, per
+ // channel, through A8R8G8B8.
+@@ -169,6 +253,255 @@ std::vector<uint8_t> Downsample(const uint8_t* src, uint32_t w, uint32_t h, gfx:
+   return out;
+ }
+ 
++// DXT1 to DXT2/DXT3, block by block (8 bytes to 16): explicit alpha 0xF
++// or, for DXT1's transparent texels, 0 (DXT2: premultiplied, so black).
++// DXT2-5 colour blocks always decode in four-colour mode, so a DXT1 block
++// in three-colour mode (c0 <= c1) is re-indexed to the nearest of the
++// four-colour palette of the same endpoints.
++void Dxt1ToDxt3Block(const uint8_t* in, uint8_t* out) {
++  uint16_t c0 = uint16_t(in[0] | in[1] << 8), c1 = uint16_t(in[2] | in[3] << 8);
++  uint32_t idx = uint32_t(in[4]) | uint32_t(in[5]) << 8 | uint32_t(in[6]) << 16 |
++                 uint32_t(in[7]) << 24;
++  uint64_t alpha = 0;
++  uint32_t nidx = idx;
++  if (c0 > c1) {
++    alpha = ~0ull;
++  } else {
++    auto rgb = [](uint16_t c, int ch) {
++      int v = ch == 0 ? (c >> 11) & 31 : ch == 1 ? (c >> 5) & 63 : c & 31;
++      return ch == 1 ? (v << 2 | v >> 4) : (v << 3 | v >> 2);
++    };
++    int pal3[3][3], pal4[4][3];
++    for (int ch = 0; ch < 3; ch++) {
++      int a = rgb(c0, ch), b = rgb(c1, ch);
++      pal3[0][ch] = a;
++      pal3[1][ch] = b;
++      pal3[2][ch] = (a + b) / 2;
++      pal4[0][ch] = a;
++      pal4[1][ch] = b;
++      pal4[2][ch] = (2 * a + b) / 3;
++      pal4[3][ch] = (a + 2 * b) / 3;
++    }
++    nidx = 0;
++    for (int i = 0; i < 16; i++) {
++      uint32_t k = (idx >> (2 * i)) & 3;
++      uint32_t best = 0;
++      if (k == 3) {
++        // Transparent: alpha 0; premultiplied colour is black, but the
++        // texel is invisible either way, so keep index 0.
++      } else {
++        alpha |= 0xFull << (4 * i);
++        int bestd = 1 << 30;
++        for (uint32_t j = 0; j < 4; j++) {
++          int d = 0;
++          for (int ch = 0; ch < 3; ch++) {
++            int e = pal3[k][ch] - pal4[j][ch];
++            d += e * e;
++          }
++          if (d < bestd) {
++            bestd = d;
++            best = j;
++          }
++        }
++      }
++      nidx |= best << (2 * i);
++    }
++  }
++  for (int i = 0; i < 8; i++) out[i] = uint8_t(alpha >> (8 * i));
++  std::memcpy(out + 8, in, 4);
++  for (int i = 0; i < 4; i++) out[12 + i] = uint8_t(nidx >> (8 * i));
++}
++
++// ---- DXT compression (uncompressed -> DXT1/3/5) -----------------------------
++// A plain bounding-box encoder: colour endpoints are the per-channel min
++// and max of the block in RGB565, each texel takes the nearest of the four
++// palette colours; DXT5 alpha the same with the eight-step palette.
++// Deterministic and good enough for UI art; not D3DX's own compressor.
++
++uint16_t To565(int r, int g, int b) {
++  return uint16_t((r * 31 + 127) / 255 << 11 | (g * 63 + 127) / 255 << 5 | (b * 31 + 127) / 255);
++}
++void From565(uint16_t c, int* rgb) {
++  int r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
++  rgb[0] = r << 3 | r >> 2;
++  rgb[1] = g << 2 | g >> 4;
++  rgb[2] = b << 3 | b >> 2;
++}
++
++// 16 ARGB texels -> an 8-byte colour block in four-colour mode.
++void EncodeColorBlock(const uint32_t* px, uint8_t* out) {
++  int lo[3] = {255, 255, 255}, hi[3] = {0, 0, 0};
++  for (int i = 0; i < 16; i++)
++    for (int ch = 0; ch < 3; ch++) {
++      int v = (px[i] >> (16 - 8 * ch)) & 0xFF;
++      lo[ch] = std::min(lo[ch], v);
++      hi[ch] = std::max(hi[ch], v);
++    }
++  uint16_t c0 = To565(hi[0], hi[1], hi[2]), c1 = To565(lo[0], lo[1], lo[2]);
++  uint32_t idx = 0;
++  if (c0 < c1) std::swap(c0, c1);
++  if (c0 != c1) {
++    int a[3], b[3], pal[4][3];
++    From565(c0, a);
++    From565(c1, b);
++    for (int ch = 0; ch < 3; ch++) {
++      pal[0][ch] = a[ch];
++      pal[1][ch] = b[ch];
++      pal[2][ch] = (2 * a[ch] + b[ch]) / 3;
++      pal[3][ch] = (a[ch] + 2 * b[ch]) / 3;
++    }
++    for (int i = 0; i < 16; i++) {
++      int best = 0, bestd = 1 << 30;
++      for (int j = 0; j < 4; j++) {
++        int d = 0;
++        for (int ch = 0; ch < 3; ch++) {
++          int e = int((px[i] >> (16 - 8 * ch)) & 0xFF) - pal[j][ch];
++          d += e * e;
++        }
++        if (d < bestd) {
++          bestd = d;
++          best = j;
++        }
++      }
++      idx |= uint32_t(best) << (2 * i);
++    }
++  }
++  out[0] = uint8_t(c0);
++  out[1] = uint8_t(c0 >> 8);
++  out[2] = uint8_t(c1);
++  out[3] = uint8_t(c1 >> 8);
++  for (int i = 0; i < 4; i++) out[4 + i] = uint8_t(idx >> (8 * i));
++}
++
++// 16 ARGB texels -> an 8-byte DXT5 alpha block (eight-alpha mode).
++void EncodeAlphaBlock(const uint32_t* px, uint8_t* out) {
++  int lo = 255, hi = 0;
++  for (int i = 0; i < 16; i++) {
++    int a = int(px[i] >> 24);
++    lo = std::min(lo, a);
++    hi = std::max(hi, a);
++  }
++  int pal[8];
++  pal[0] = hi;
++  pal[1] = lo;
++  for (int k = 1; k < 7; k++) pal[k + 1] = ((7 - k) * hi + k * lo) / 7;
++  uint64_t bits = 0;
++  for (int i = 0; i < 16; i++) {
++    int a = int(px[i] >> 24), best = 0, bestd = 1 << 30;
++    for (int j = 0; j < 8; j++)
++      if (std::abs(a - pal[j]) < bestd) {
++        bestd = std::abs(a - pal[j]);
++        best = j;
++      }
++    bits |= uint64_t(best) << (3 * i);
++  }
++  out[0] = uint8_t(hi);
++  out[1] = uint8_t(lo);
++  for (int i = 0; i < 6; i++) out[2 + i] = uint8_t(bits >> (8 * i));
++}
++
++// A DXT1-5 block -> 16 ARGB texels (DXT2/4 stay premultiplied).
++void DecodeDxtBlock(const uint8_t* blk, uint32_t fmt, uint32_t* px) {
++  const uint8_t* cb = fmt == D3DFMT_DXT1 ? blk : blk + 8;
++  uint16_t c0 = uint16_t(cb[0] | cb[1] << 8), c1 = uint16_t(cb[2] | cb[3] << 8);
++  int a[3], b[3];
++  From565(c0, a);
++  From565(c1, b);
++  uint32_t pal[4];
++  bool four = fmt != D3DFMT_DXT1 || c0 > c1;
++  auto pack = [](int r, int g, int bb, uint32_t al) {
++    return al << 24 | uint32_t(r) << 16 | uint32_t(g) << 8 | uint32_t(bb);
++  };
++  pal[0] = pack(a[0], a[1], a[2], 255);
++  pal[1] = pack(b[0], b[1], b[2], 255);
++  if (four) {
++    pal[2] = pack((2 * a[0] + b[0]) / 3, (2 * a[1] + b[1]) / 3, (2 * a[2] + b[2]) / 3, 255);
++    pal[3] = pack((a[0] + 2 * b[0]) / 3, (a[1] + 2 * b[1]) / 3, (a[2] + 2 * b[2]) / 3, 255);
++  } else {
++    pal[2] = pack((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2, 255);
++    pal[3] = 0;  // transparent black
++  }
++  uint32_t idx = uint32_t(cb[4]) | uint32_t(cb[5]) << 8 | uint32_t(cb[6]) << 16 |
++                 uint32_t(cb[7]) << 24;
++  for (int i = 0; i < 16; i++) px[i] = pal[(idx >> (2 * i)) & 3];
++  if (fmt == D3DFMT_DXT2 || fmt == D3DFMT_DXT3) {
++    for (int i = 0; i < 16; i++) {
++      uint32_t al = (blk[i / 2] >> (4 * (i & 1))) & 0xF;
++      px[i] = (px[i] & 0xFFFFFF) | (al * 0x11) << 24;
++    }
++  } else if (fmt == D3DFMT_DXT4 || fmt == D3DFMT_DXT5) {
++    int a0 = blk[0], a1 = blk[1], ap[8];
++    ap[0] = a0;
++    ap[1] = a1;
++    if (a0 > a1) {
++      for (int k = 1; k < 7; k++) ap[k + 1] = ((7 - k) * a0 + k * a1) / 7;
++    } else {
++      for (int k = 1; k < 5; k++) ap[k + 1] = ((5 - k) * a0 + k * a1) / 5;
++      ap[6] = 0;
++      ap[7] = 255;
++    }
++    uint64_t bits = 0;
++    for (int i = 0; i < 6; i++) bits |= uint64_t(blk[2 + i]) << (8 * i);
++    for (int i = 0; i < 16; i++)
++      px[i] = (px[i] & 0xFFFFFF) | uint32_t(ap[(bits >> (3 * i)) & 7]) << 24;
++  }
++}
++
++// A level in format `f` (D3DFORMAT d3d) -> w x h ARGB texels.
++std::vector<uint32_t> DecodeLevel(const uint8_t* q, uint32_t w, uint32_t h, uint32_t d3d,
++                                  gfx::Format f) {
++  std::vector<uint32_t> argb(size_t(w) * h);
++  if (gfx::IsCompressed(f)) {
++    size_t bs = d3d == D3DFMT_DXT1 ? 8 : 16;
++    uint32_t bw = (w + 3) / 4;
++    for (uint32_t by = 0; by < (h + 3) / 4; by++)
++      for (uint32_t bx = 0; bx < bw; bx++) {
++        uint32_t px[16];
++        DecodeDxtBlock(q + (size_t(by) * bw + bx) * bs, d3d, px);
++        for (uint32_t i = 0; i < 16; i++) {
++          uint32_t x = bx * 4 + i % 4, y = by * 4 + i / 4;
++          if (x < w && y < h) argb[size_t(y) * w + x] = px[i];
++        }
++      }
++    return argb;
++  }
++  uint32_t fb = gfx::BitsPerPixel(f) / 8;
++  for (uint32_t y = 0; y < h; y++)
++    for (uint32_t x = 0; x < w; x++)
++      argb[size_t(y) * w + x] =
++          gfx::DecodePixel(q + size_t(y) * gfx::RowPitch(f, w) + size_t(x) * fb, f);
++  return argb;
++}
++
++// A level of ARGB texels (w x h, tightly packed) -> DXT1/3/5 blocks.
++void CompressLevel(const uint32_t* argb, uint32_t w, uint32_t h, uint32_t fmt,
++                   std::vector<uint8_t>* out) {
++  for (uint32_t by = 0; by < h; by += 4)
++    for (uint32_t bx = 0; bx < w; bx += 4) {
++      uint32_t px[16];
++      for (uint32_t i = 0; i < 16; i++) {
++        uint32_t x = std::min(w - 1, bx + i % 4), y = std::min(h - 1, by + i / 4);
++        px[i] = argb[size_t(y) * w + x];
++      }
++      uint8_t blk[16];
++      size_t n = 8;
++      if (fmt == D3DFMT_DXT1) {
++        EncodeColorBlock(px, blk);
++      } else {
++        if (fmt == D3DFMT_DXT5) {
++          EncodeAlphaBlock(px, blk);
++        } else {  // DXT3: explicit four-bit alpha
++          uint64_t a = 0;
++          for (int i = 0; i < 16; i++) a |= uint64_t((px[i] >> 28) & 0xF) << (4 * i);
++          for (int i = 0; i < 8; i++) blk[i] = uint8_t(a >> (8 * i));
++        }
++        EncodeColorBlock(px, blk + 8);
++        n = 16;
++      }
++      out->insert(out->end(), blk, blk + n);
++    }
++}
++
+ // The D3DXCreate(Cube)TextureFromFileInMemory(Ex) core.
+ uint32_t CreateFromMemory(Ctx& c, bool cube, uint32_t device, uint32_t src, uint32_t size,
+                           uint32_t width, uint32_t height, uint32_t levels, uint32_t usage,
+@@ -179,20 +512,28 @@ uint32_t CreateFromMemory(Ctx& c, bool cube, uint32_t device, uint32_t src, uint
+   const uint8_t* p = reinterpret_cast<const uint8_t*>(GPtr(src));
+   Image img;
+   std::string why;
+-  if (!ParseDds(p, size, &img, &why)) {
++  std::vector<uint8_t> png;
++  uint32_t file_format = D3DXIFF_DDS;
++  if (ParsePng(p, size, &img, &png)) {
++    file_format = D3DXIFF_PNG;
++  } else if (ParseJpeg(p, size, &img, &png)) {
++    file_format = D3DXIFF_JPG;
++  } else if (!ParseDds(p, size, &img, &why)) {
+     char magic[5] = {};
+     std::memcpy(magic, p, std::min<uint32_t>(4, size));
+     for (char& ch : magic)
+       if (ch && (ch < 32 || ch > 126)) ch = '.';
+-    FatalF("d3dx9: texture from memory: %s (%u bytes, starts \"%s\"): not supported yet",
+-           why.c_str(), size, magic);
++    FatalF("d3dx9: texture from memory: %s (%u bytes, starts \"%s\" = %02X %02X %02X %02X): "
++           "not supported yet",
++           why.c_str(), size, magic, size > 0 ? p[0] : 0, size > 1 ? p[1] : 0,
++           size > 2 ? p[2] : 0, size > 3 ? p[3] : 0);
+   }
+   if (img.cube != cube)
+     FatalF("d3dx9: a %s DDS for a %s texture", img.cube ? "cube" : "2D",
+            cube ? "cube" : "2D");
+   if (info) {
+     *G<D3DXIMAGE_INFO>(info) = {img.width, img.height, 1, img.levels, img.format,
+-                                cube ? D3DRTYPE_CUBETEXTURE : D3DRTYPE_TEXTURE, D3DXIFF_DDS};
++                                cube ? D3DRTYPE_CUBETEXTURE : D3DRTYPE_TEXTURE, file_format};
+   }
+   auto from_file = [](uint32_t v) {
+     return v == 0 || v == D3DX_DEFAULT || v == D3DX_DEFAULT_NONPOW2 || v == D3DX_FROM_FILE;
+@@ -205,8 +546,51 @@ uint32_t CreateFromMemory(Ctx& c, bool cube, uint32_t device, uint32_t src, uint
+            img.height, w, h);
+   uint32_t fmt = (format == D3DFMT_UNKNOWN || format == D3DX_DEFAULT ||
+                   format == D3DFMT_FROM_FILE) ? img.format : format;
+-  if (fmt != img.format)
+-    FatalF("d3dx9: converting format %X to %X not supported yet", img.format, fmt);
++  // Format conversion (below): DXT1 to DXT2/3 block by block, anything
++  // else through A8R8G8B8.
++  std::vector<uint8_t> converted;
++  if (img.format == D3DFMT_DXT1 && (fmt == D3DFMT_DXT2 || fmt == D3DFMT_DXT3)) {
++    gfx::Format from = FormatFromD3D(img.format);
++    uint32_t blocks = 0;
++    for (uint32_t i = 0; i < img.levels; i++)
++      blocks += LevelSize(from, std::max(1u, img.width >> i), std::max(1u, img.height >> i)) / 8;
++    blocks *= img.cube ? 6 : 1;
++    converted.resize(size_t(blocks) * 16);
++    for (uint32_t b = 0; b < blocks; b++)
++      Dxt1ToDxt3Block(img.data + size_t(b) * 8, converted.data() + size_t(b) * 16);
++    img.data = converted.data();
++    img.format = fmt;
++  }
++  // Any other conversion: each level decoded to A8R8G8B8, then encoded in
++  // the target format (DXT1/3/5 by CompressLevel, uncompressed formats
++  // EncodePixel writes).
++  if (fmt != img.format) {
++    gfx::Format from = FormatFromD3D(img.format), to = FormatFromD3D(fmt);
++    bool to_dxt = fmt == D3DFMT_DXT1 || fmt == D3DFMT_DXT3 || fmt == D3DFMT_DXT5;
++    if (to == gfx::Format::Unknown || (gfx::IsCompressed(to) && !to_dxt) ||
++        (!gfx::IsCompressed(to) && gfx::BitsPerPixel(to) % 8 != 0))
++      FatalF("d3dx9: converting format %X to %X not supported yet", img.format, fmt);
++    std::vector<uint8_t> out;
++    const uint8_t* q = img.data;
++    for (uint32_t face = 0; face < (img.cube ? 6u : 1u); face++)
++      for (uint32_t i = 0; i < img.levels; i++) {
++        uint32_t lw = std::max(1u, img.width >> i), lh = std::max(1u, img.height >> i);
++        std::vector<uint32_t> argb = DecodeLevel(q, lw, lh, img.format, from);
++        if (to_dxt) {
++          CompressLevel(argb.data(), lw, lh, fmt, &out);
++        } else {
++          uint32_t tb = gfx::BitsPerPixel(to) / 8;
++          size_t at = out.size();
++          out.resize(at + size_t(gfx::RowPitch(to, lw)) * lh);
++          for (size_t k = 0; k < argb.size(); k++)
++            gfx::EncodePixel(out.data() + at + k * tb, to, argb[k]);
++        }
++        q += LevelSize(from, lw, lh);
++      }
++    converted = std::move(out);
++    img.data = converted.data();
++    img.format = fmt;
++  }
+   gfx::Format f = FormatFromD3D(fmt);
+   uint32_t full = 1;
+   for (uint32_t s = std::max(w, h); s > 1; s >>= 1) full++;
+@@ -264,6 +648,63 @@ HLE("d3dx9_35.dll", D3DXCreateTextureFromFileInMemoryEx, 15) {
+                           Arg(c, 14));
+ }
+ 
++// (pDevice, pSrcData, SrcDataSize, Width, Height, Depth, MipLevels, Usage,
++// Format, Pool, Filter, MipFilter, ColorKey, pSrcInfo, pPalette,
++// ppVolumeTexture): volume DDS files, at their own size and format.
++HLE("d3dx9_35.dll", D3DXCreateVolumeTextureFromFileInMemoryEx, 16) {
++  uint32_t device = Arg(c, 0), src = Arg(c, 1), size = Arg(c, 2), out = Arg(c, 15);
++  Wr32(out, 0);
++  if (!EnsureReadable(c, src, size)) return D3DERR_INVALIDCALL;
++  const uint8_t* p = reinterpret_cast<const uint8_t*>(GPtr(src));
++  DdsHeader h;
++  if (size < 128 || std::memcmp(p, "DDS ", 4) != 0) return D3DXERR_INVALIDDATA;
++  std::memcpy(&h, p + 4, sizeof h);
++  // A volume DDS has DDSCAPS2_VOLUME (or DDSD_DEPTH) and a depth; D3DX
++  // loads a 2D DDS as a volume of depth 1.
++  constexpr uint32_t DDSD_DEPTH = 0x800000;
++  if (h.size != 124) return D3DXERR_INVALIDDATA;
++  if (h.caps2 & DDSCAPS2_CUBEMAP) FatalF("d3dx9: a cube DDS for a volume texture");
++  bool volume = (h.caps2 & DDSCAPS2_VOLUME) || (h.flags & DDSD_DEPTH);
++  uint32_t fmt = DdsFormat(h);
++  gfx::Format f = FormatFromD3D(fmt);
++  if (f == gfx::Format::Unknown) FatalF("d3dx9: volume DDS pixel format not supported");
++  uint32_t w = h.width, ht = h.height, depth = volume ? std::max(1u, h.depth) : 1;
++  uint32_t levels = std::max(1u, h.mip_count);
++  uint32_t need = 0;
++  for (uint32_t i = 0; i < levels; i++)
++    need += LevelSize(f, std::max(1u, w >> i), std::max(1u, ht >> i)) *
++            std::max(1u, depth >> i);
++  if (size - 128 < need) return D3DXERR_INVALIDDATA;
++  auto from_file = [](uint32_t v) {
++    return v == 0 || v == D3DX_DEFAULT || v == D3DX_DEFAULT_NONPOW2 || v == D3DX_FROM_FILE;
++  };
++  if ((!from_file(Arg(c, 3)) && Arg(c, 3) != w) || (!from_file(Arg(c, 4)) && Arg(c, 4) != ht) ||
++      (!from_file(Arg(c, 5)) && Arg(c, 5) != depth))
++    FatalF("d3dx9: resizing a %ux%ux%u volume not supported yet", w, ht, depth);
++  uint32_t format = Arg(c, 8);
++  if (format != D3DFMT_UNKNOWN && format != D3DX_DEFAULT && format != D3DFMT_FROM_FILE &&
++      format != fmt)
++    FatalF("d3dx9: converting volume format %X to %X not supported yet", fmt, format);
++  if (uint32_t info = Arg(c, 13))
++    *G<D3DXIMAGE_INFO>(info) = {w, ht, depth, levels, fmt, D3DRTYPE_VOLUMETEXTURE, D3DXIFF_DDS};
++  Device* d = DeviceOf(device);
++  uint32_t tex;
++  uint32_t hr = NewVolumeTexture(*d, device, w, ht, depth, levels, Arg(c, 7), fmt, Arg(c, 9), &tex);
++  if (hr != D3D_OK) return hr;
++  VolumeTexture* t = com::As<VolumeTexture>(tex);
++  const uint8_t* q = p + 128;
++  for (uint32_t i = 0; i < t->levels; i++) {
++    uint32_t lw = std::max(1u, w >> i), lh = std::max(1u, ht >> i);
++    uint32_t slice = LevelSize(f, lw, lh);
++    FillVolumeLevel(*t, i, q, gfx::RowPitch(f, lw), slice);
++    q += slice * std::max(1u, depth >> i);
++  }
++  Wr32(out, tex);
++  RECOMP_TRACE("  volume texture from memory: DDS %ux%ux%u x%u fmt %X\n", w, ht, depth, levels,
++               fmt);
++  return D3D_OK;
++}
++
+ // (pDevice, pSrcData, SrcDataSize, ppCubeTexture)
+ HLE("d3dx9_35.dll", D3DXCreateCubeTextureFromFileInMemory, 4) {
+   return CreateFromMemory(c, true, Arg(c, 0), Arg(c, 1), Arg(c, 2), D3DX_DEFAULT,
+@@ -271,6 +712,14 @@ HLE("d3dx9_35.dll", D3DXCreateCubeTextureFromFileInMemory, 4) {
+                           0, Arg(c, 3));
+ }
+ 
++// (pDevice, pSrcData, SrcDataSize, Size, MipLevels, Usage, Format, Pool,
++// Filter, MipFilter, ColorKey, pSrcInfo, pPalette, ppCubeTexture)
++HLE("d3dx9_35.dll", D3DXCreateCubeTextureFromFileInMemoryEx, 14) {
++  return CreateFromMemory(c, true, Arg(c, 0), Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 3),
++                          Arg(c, 4), Arg(c, 5), Arg(c, 6), Arg(c, 7), Arg(c, 10), Arg(c, 11),
++                          Arg(c, 13));
++}
++
+ // ---- maths -----------------------------------------------------------------------------
+ // In single precision, operations in the order D3DX evaluates them (built
+ // without FMA contraction, see CMakeLists.txt): the game's own maths uses
 diff --git a/platforms/win32/src/win32/kernel32.cpp b/platforms/win32/src/win32/kernel32.cpp
 index 2a04eb3..91dc443 100644
 --- a/platforms/win32/src/win32/kernel32.cpp
@@ -85,6 +1088,88 @@ index 2a04eb3..91dc443 100644
  
  // ---- time ----------------------------------------------------------------
  
+diff --git a/platforms/win32/src/win32/kernel32_file.cpp b/platforms/win32/src/win32/kernel32_file.cpp
+index 1521986..c437f4f 100644
+--- a/platforms/win32/src/win32/kernel32_file.cpp
++++ b/platforms/win32/src/win32/kernel32_file.cpp
+@@ -370,6 +370,41 @@ int FdOf(uint64_t h) {
+   return o ? FileFd(o.get()) : -1;
+ }
+ 
++// OVERLAPPED: Internal, InternalHigh (ULONG_PTR each), Offset, OffsetHigh,
++// hEvent. Overlapped transfers complete synchronously, which Windows
++// allows: at the OVERLAPPED's offset (the file pointer is not used),
++// Internal = STATUS_SUCCESS, InternalHigh = the bytes moved, hEvent set.
++struct OverlappedLayout {
++  uint32_t internal_high, offset, event;
++};
++OverlappedLayout OverlappedOf() {
++  return g_proc->x64 ? OverlappedLayout{8, 16, 24} : OverlappedLayout{4, 8, 16};
++}
++
++uint64_t OverlappedTransfer(Ctx& c, int fd, bool write) {
++  gaddr buf = Arg(c, 1), out = Arg(c, 3), ov = Arg(c, 4);
++  uint32_t n = uint32_t(Arg(c, 2));
++  const OverlappedLayout l = OverlappedOf();
++  off_t at = off_t(uint64_t(Rd32(ov + l.offset + 4)) << 32 | Rd32(ov + l.offset));
++  lazy::Touch(buf, n);
++  ssize_t r = !n ? 0 : write ? pwrite(fd, GPtr(buf), n, at) : pread(fd, GPtr(buf), n, at);
++  if (r < 0) {
++    SetLastError(ErrnoToWin(errno));
++    return 0;
++  }
++  if (g_proc->x64) {
++    Wr64(ov, 0);
++    Wr64(ov + l.internal_high, uint64_t(r));
++  } else {
++    Wr32(ov, 0);
++    Wr32(ov + l.internal_high, uint32_t(r));
++  }
++  if (out) Wr32(out, uint32_t(r));
++  uint32_t ev = Rd32(ov + l.event);
++  if (ev) SignalEventHandle(ev, false);
++  return 1;
++}
++
+ HLE64("kernel32.dll", ReadFile, 5) {
+   int fd = FdOf(Arg(c, 0));
+   gaddr buf = Arg(c, 1), out = Arg(c, 3);
+@@ -378,7 +413,7 @@ HLE64("kernel32.dll", ReadFile, 5) {
+     SetLastError(kErrorInvalidHandle);
+     return 0;
+   }
+-  if (Arg(c, 4)) FatalF("ReadFile with OVERLAPPED is not supported");
++  if (Arg(c, 4)) return OverlappedTransfer(c, fd, false);
+   lazy::Touch(buf, n);  // the kernel does not fault on lazy pages
+   ssize_t r = n ? read(fd, GPtr(buf), n) : 0;
+   if (r < 0) {
+@@ -397,6 +432,7 @@ HLE64("kernel32.dll", WriteFile, 5) {
+     SetLastError(kErrorInvalidHandle);
+     return 0;
+   }
++  if (Arg(c, 4)) return OverlappedTransfer(c, fd, true);
+   lazy::Touch(buf, n);
+   ssize_t r = n ? write(fd, GPtr(buf), n) : 0;
+   if (r < 0) {
+@@ -407,6 +443,18 @@ HLE64("kernel32.dll", WriteFile, 5) {
+   return 1;
+ }
+ 
++// (hFile, lpOverlapped, lpNumberOfBytesTransferred, bWait): overlapped
++// transfers complete synchronously, so the result is always there.
++HLE64("kernel32.dll", GetOverlappedResult, 4) {
++  gaddr ov = Arg(c, 1), out = Arg(c, 2);
++  const OverlappedLayout l = OverlappedOf();
++  if (out) Wr32(out, Rd32(ov + l.internal_high));
++  return 1;
++}
++
++// Nothing is ever pending to cancel.
++HLE64("kernel32.dll", CancelIo, 1) { return 1; }
++
+ HLE64("kernel32.dll", SetFilePointer, 4) {
+   int fd = FdOf(Arg(c, 0));
+   int64_t dist = int32_t(Arg(c, 1));
 diff --git a/platforms/win32/src/win32/pe_image.cpp b/platforms/win32/src/win32/pe_image.cpp
 index 1f2d0dc..75e859f 100644
 --- a/platforms/win32/src/win32/pe_image.cpp
@@ -249,6 +1334,32 @@ index f3aaec5..64080de 100644
  };
  
  // The Win32 side of g_proc.
+diff --git a/platforms/win32/src/win32/shell_net.cpp b/platforms/win32/src/win32/shell_net.cpp
+index 7a3abeb..59f963f 100644
+--- a/platforms/win32/src/win32/shell_net.cpp
++++ b/platforms/win32/src/win32/shell_net.cpp
+@@ -6,7 +6,7 @@
+ // Documents and Settings/Player/My Documents/...
+ //
+ // Networking: wsock32 only answers host-name queries (DirectPlay8 is not
+-// provided).
++// provided); iphlpapi reports no adapters.
+ 
+ #include <sys/stat.h>
+ 
+@@ -181,4 +181,12 @@ HLE64("shell32.dll", CommandLineToArgvW, 2) {
+   return block;
+ }
+ 
++// GetAdaptersInfo(pAdapterInfo, pOutBufLen): no adapters (games use it
++// for a MAC address as a machine ID; they fall back without one).
++constexpr uint32_t kErrorNoData = 232;
++HLE("iphlpapi.dll", GetAdaptersInfo, 2) {
++  if (Arg(c, 1)) Wr32(Arg(c, 1), 0);
++  return kErrorNoData;
++}
++
+ }  // namespace recomp::hle
 diff --git a/platforms/win32/src/win32/user32_window.cpp b/platforms/win32/src/win32/user32_window.cpp
 index ce8f08b..bba5bd3 100644
 --- a/platforms/win32/src/win32/user32_window.cpp
@@ -276,11 +1387,631 @@ index ce8f08b..bba5bd3 100644
  HLE("user32.dll", GetWindowTextA, 3) {
    std::lock_guard<std::recursive_mutex> l(g_mu);
    Window* w = Win(Arg(c, 0));
+diff --git a/platforms/win32/src/win32/ws2_32.cpp b/platforms/win32/src/win32/ws2_32.cpp
+index 3e3ae1f..15c55cf 100644
+--- a/platforms/win32/src/win32/ws2_32.cpp
++++ b/platforms/win32/src/win32/ws2_32.cpp
+@@ -5,14 +5,19 @@
+ 
+ #include <arpa/inet.h>
+ #include <fcntl.h>
++#include <netdb.h>
+ #include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <poll.h>
+ #include <sys/ioctl.h>
+ #include <sys/socket.h>
+ #include <unistd.h>
+ 
++#include <algorithm>
+ #include <cerrno>
+ #include <cstring>
+ #include <memory>
++#include <vector>
+ 
+ #include "runtime/log.h"
+ #include "win32/hle.h"
+@@ -279,4 +284,250 @@ HLE64("ws2_32.dll", inet_ntop, 4) {
+   return Arg(c, 2);
+ }
+ 
++// ---- TCP ----------------------------------------------------------------
++
++RECOMP_WS2(4, connect, 3) {
++  int fd = SocketFd(Arg(c, 0));
++  if (fd < 0) return Fail(kWsaENotSock);
++  sockaddr_storage sa;
++  socklen_t len;
++  if (!ToHost(Arg(c, 1), uint32_t(Arg(c, 2)), &sa, &len)) return Fail(kWsaEAfNoSupport);
++  if (::connect(fd, reinterpret_cast<sockaddr*>(&sa), len) == 0) return 0;
++  // A non-blocking connect in progress is WSAEWOULDBLOCK on Windows.
++  return Fail(errno == EINPROGRESS ? kWsaEWouldBlock : WsaError(errno));
++}
++
++RECOMP_WS2(13, listen, 2) {
++  int fd = SocketFd(Arg(c, 0));
++  if (fd < 0) return Fail(kWsaENotSock);
++  return ::listen(fd, int(Arg(c, 1))) == 0 ? 0 : FailErrno();
++}
++
++RECOMP_WS2(1, accept, 3) {
++  int fd = SocketFd(Arg(c, 0));
++  if (fd < 0) {
++    t_wsa_error = kWsaENotSock;
++    return InvalidSocket();
++  }
++  sockaddr_storage sa{};
++  socklen_t len = sizeof sa;
++  int nfd = ::accept(fd, reinterpret_cast<sockaddr*>(&sa), &len);
++  if (nfd < 0) {
++    t_wsa_error = WsaError(errno);
++    return InvalidSocket();
++  }
++  fcntl(nfd, F_SETFD, FD_CLOEXEC);
++#ifdef SO_NOSIGPIPE
++  int one = 1;
++  setsockopt(nfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
++#endif
++  ToGuest(sa, Arg(c, 1), Arg(c, 2));
++  auto o = std::make_shared<SocketObject>();
++  o->fd = nfd;
++  return NewHandle(o);
++}
++
++RECOMP_WS2(19, send, 4) {
++  int fd = SocketFd(Arg(c, 0));
++  if (fd < 0) return Fail(kWsaENotSock);
++  ssize_t n = ::send(fd, GPtr(Arg(c, 1)), size_t(uint32_t(Arg(c, 2))),
++                     int(Arg(c, 3)) | kNoSignal);
++  return n < 0 ? FailErrno() : uint64_t(uint32_t(n));
++}
++
++RECOMP_WS2(16, recv, 4) {
++  int fd = SocketFd(Arg(c, 0));
++  if (fd < 0) return Fail(kWsaENotSock);
++  ssize_t n = ::recv(fd, GPtr(Arg(c, 1)), size_t(uint32_t(Arg(c, 2))), int(Arg(c, 3)));
++  return n < 0 ? FailErrno() : uint64_t(uint32_t(n));
++}
++
++RECOMP_WS2(6, getsockname, 3) {
++  int fd = SocketFd(Arg(c, 0));
++  if (fd < 0) return Fail(kWsaENotSock);
++  sockaddr_storage sa{};
++  socklen_t len = sizeof sa;
++  if (::getsockname(fd, reinterpret_cast<sockaddr*>(&sa), &len) != 0) return FailErrno();
++  ToGuest(sa, Arg(c, 1), Arg(c, 2));
++  return 0;
++}
++
++// setsockopt(s, level, name, value, len): Windows' option values mapped to
++// the host's. Unknown options are accepted and ignored, with a warning.
++RECOMP_WS2(21, setsockopt, 5) {
++  int fd = SocketFd(Arg(c, 0));
++  if (fd < 0) return Fail(kWsaENotSock);
++  uint32_t level = uint32_t(Arg(c, 1)), name = uint32_t(Arg(c, 2));
++  gaddr val = Arg(c, 3);
++  uint32_t len = uint32_t(Arg(c, 4));
++  int v = len >= 4 ? int(Rd32(val)) : len >= 1 ? Rd8(val) : 0;
++  int hl = -1, hn = -1;
++  if (level == 0xFFFF) {  // SOL_SOCKET
++    hl = SOL_SOCKET;
++    switch (name) {
++      case 0x0004: hn = SO_REUSEADDR; break;
++      case 0x0008: hn = SO_KEEPALIVE; break;
++      case 0x0020: hn = SO_BROADCAST; break;
++      case 0x1001: hn = SO_SNDBUF; break;
++      case 0x1002: hn = SO_RCVBUF; break;
++      case 0x0080: {  // SO_LINGER: {u_short onoff, u_short linger}
++        linger l{Rd16(val), Rd16(val + 2)};
++        return ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof l) == 0 ? 0 : FailErrno();
++      }
++      case 0x1005:    // SO_SNDTIMEO, SO_RCVTIMEO: DWORD milliseconds
++      case 0x1006: {
++        timeval tv{v / 1000, (v % 1000) * 1000};
++        return ::setsockopt(fd, SOL_SOCKET, name == 0x1005 ? SO_SNDTIMEO : SO_RCVTIMEO, &tv,
++                            sizeof tv) == 0
++                   ? 0
++                   : FailErrno();
++      }
++    }
++  } else if (level == 6 && name == 1) {  // IPPROTO_TCP, TCP_NODELAY
++    hl = IPPROTO_TCP;
++    hn = TCP_NODELAY;
++  } else if (level == 0) {  // IPPROTO_IP
++    hl = IPPROTO_IP;
++    if (name == 4) hn = IP_TTL;
++  }
++  if (hn < 0) {
++    WarnF("setsockopt(level %u, option %u): ignored\n", level, name);
++    return 0;
++  }
++  return ::setsockopt(fd, hl, hn, &v, sizeof v) == 0 ? 0 : FailErrno();
++}
++
++// fd_set (32-bit): u_int fd_count; SOCKET fd_array[64].
++constexpr uint32_t kFdSetSize = 64;
++
++// select(nfds, readfds, writefds, exceptfds, timeout): on poll(2). The
++// sets are rewritten to hold the ready sockets; timeout is a 32-bit
++// timeval, NULL to wait without limit.
++RECOMP_WS2(18, select, 5) {
++  struct Entry {
++    gaddr set;
++    uint32_t sock;
++    short events;
++  };
++  std::vector<pollfd> fds;
++  std::vector<Entry> entries;
++  const gaddr sets[3] = {Arg(c, 1), Arg(c, 2), Arg(c, 3)};
++  const short ev[3] = {POLLIN, POLLOUT, POLLPRI};
++  for (int k = 0; k < 3; k++) {
++    if (!sets[k]) continue;
++    uint32_t n = std::min(Rd32(sets[k]), kFdSetSize);
++    for (uint32_t i = 0; i < n; i++) {
++      uint32_t s = Rd32(sets[k] + 4 + 4 * i);
++      int fd = SocketFd(s);
++      if (fd < 0) return Fail(kWsaENotSock);
++      fds.push_back({fd, ev[k], 0});
++      entries.push_back({sets[k], s, ev[k]});
++    }
++  }
++  int ms = -1;
++  if (gaddr tv = Arg(c, 4)) ms = int(Rd32(tv)) * 1000 + int(Rd32(tv + 4)) / 1000;
++  int r = ::poll(fds.data(), nfds_t(fds.size()), ms);
++  if (r < 0) return FailErrno();
++  for (int k = 0; k < 3; k++)
++    if (sets[k]) Wr32(sets[k], 0);
++  uint32_t ready = 0;
++  for (size_t i = 0; i < fds.size(); i++) {
++    short got = fds[i].revents;
++    // A failed connect shows in exceptfds on Windows; hangups read as EOF.
++    bool hit = entries[i].events == POLLIN    ? (got & (POLLIN | POLLHUP | POLLERR)) != 0
++               : entries[i].events == POLLOUT ? (got & POLLOUT) != 0
++                                              : (got & (POLLPRI | POLLERR)) != 0;
++    if (!hit) continue;
++    gaddr set = entries[i].set;
++    uint32_t n = Rd32(set);
++    Wr32(set + 4 + 4 * n, entries[i].sock);
++    Wr32(set, n + 1);
++    ready++;
++  }
++  return ready;
++}
++
++RECOMP_WS2(151, __WSAFDIsSet, 2) {
++  uint32_t s = uint32_t(Arg(c, 0));
++  gaddr set = Arg(c, 1);
++  uint32_t n = std::min(Rd32(set), kFdSetSize);
++  for (uint32_t i = 0; i < n; i++)
++    if (Rd32(set + 4 + 4 * i) == s) return 1;
++  return 0;
++}
++
++// WSAAsyncSelect(s, hwnd, msg, events): makes the socket non-blocking, as
++// Windows does. The window notifications themselves are not delivered.
++RECOMP_WS2(101, WSAAsyncSelect, 4) {
++  int fd = SocketFd(Arg(c, 0));
++  if (fd < 0) return Fail(kWsaENotSock);
++  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
++  if (Arg(c, 3)) WarnF("WSAAsyncSelect(events %08X): notifications not delivered\n",
++                       uint32_t(Arg(c, 3)));
++  return 0;
++}
++
++// ---- names ----------------------------------------------------------------
++
++RECOMP_WS2(57, gethostname, 2) {
++  char buf[256] = {};
++  if (::gethostname(buf, sizeof buf - 1) != 0) return FailErrno();
++  if (std::strlen(buf) + 1 > uint32_t(Arg(c, 1))) return Fail(10014);  // WSAEFAULT
++  PutStr(Arg(c, 0), buf);
++  return 0;
++}
++
++// inet_addr(cp) -> the IPv4 address in network order, INADDR_NONE if bad.
++RECOMP_WS2(11, inet_addr, 1) {
++  in_addr a;
++  if (::inet_aton(GStr(Arg(c, 0)).c_str(), &a) == 0) return 0xFFFFFFFFu;
++  return a.s_addr;
++}
++
++// inet_ntoa(in_addr) -> a per-thread static string.
++RECOMP_WS2(12, inet_ntoa, 1) {
++  thread_local gaddr buf = 0;
++  if (!buf) buf = HeapAllocProcess(16, true);
++  in_addr a;
++  a.s_addr = uint32_t(Arg(c, 0));
++  PutStr(buf, ::inet_ntoa(a));
++  return buf;
++}
++
++// gethostbyname(name) -> a per-thread static HOSTENT (32-bit: h_name,
++// h_aliases, short h_addrtype, short h_length, h_addr_list), IPv4 only.
++RECOMP_WS2(52, gethostbyname, 1) {
++  constexpr uint32_t kMaxAddrs = 8, kNameMax = 256;
++  // hostent (16) + alias list (4) + addr list (4 * 9) + addrs (4 * 8) + name.
++  constexpr uint32_t kHostentSize = 16 + 4 + 4 * (kMaxAddrs + 1) + 4 * kMaxAddrs + kNameMax;
++  thread_local gaddr he = 0;
++  if (!he) he = HeapAllocProcess(kHostentSize, true);
++  std::string name = GStr(Arg(c, 0));
++  addrinfo hints{}, *res = nullptr;
++  hints.ai_family = AF_INET;
++  if (::getaddrinfo(name.c_str(), nullptr, &hints, &res) != 0 || !res) {
++    t_wsa_error = 11001;  // WSAHOST_NOT_FOUND
++    return 0;
++  }
++  const gaddr aliases = he + 16, list = aliases + 4, addrs = list + 4 * (kMaxAddrs + 1),
++              hname = addrs + 4 * kMaxAddrs;
++  uint32_t n = 0;
++  for (addrinfo* r = res; r && n < kMaxAddrs; r = r->ai_next) {
++    auto* sin = reinterpret_cast<sockaddr_in*>(r->ai_addr);
++    std::memcpy(GPtr(addrs + 4 * n), &sin->sin_addr, 4);
++    Wr32(list + 4 * n, uint32_t(addrs + 4 * n));
++    n++;
++  }
++  ::freeaddrinfo(res);
++  Wr32(list + 4 * n, 0);
++  Wr32(aliases, 0);
++  PutStr(hname, name.substr(0, kNameMax - 1));
++  Wr32(he + 0, uint32_t(hname));
++  Wr32(he + 4, uint32_t(aliases));
++  Wr16(he + 8, kAfInet);
++  Wr16(he + 10, 4);
++  Wr32(he + 12, uint32_t(list));
++  return he;
++}
++
+ }  // namespace recomp::hle
+diff --git a/src/runtime/gfx/format.cpp b/src/runtime/gfx/format.cpp
+index 28cc240..1937f28 100644
+--- a/src/runtime/gfx/format.cpp
++++ b/src/runtime/gfx/format.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include "runtime/gfx/device.h"
+ 
++#include <cstring>
++
+ namespace recomp::gfx {
+ 
+ uint32_t BitsPerPixel(Format f) {
+@@ -84,7 +86,72 @@ void PutRawPixel(uint8_t* p, Format f, uint32_t v) {
+   }
+ }
+ 
++// IEEE half to float.
++float HalfToFloat(uint16_t h) {
++  uint32_t sign = uint32_t(h >> 15) << 31, exp = (h >> 10) & 0x1F, man = h & 0x3FF;
++  uint32_t bits;
++  if (exp == 0) {
++    if (man == 0) {
++      bits = sign;
++    } else {  // subnormal: normalise
++      int e = -1;
++      do {
++        man <<= 1;
++        e++;
++      } while (!(man & 0x400));
++      bits = sign | uint32_t(127 - 15 - e) << 23 | (man & 0x3FF) << 13;
++    }
++  } else if (exp == 31) {
++    bits = sign | 0x7F800000u | man << 13;
++  } else {
++    bits = sign | (exp + 127 - 15) << 23 | man << 13;
++  }
++  float v;
++  std::memcpy(&v, &bits, 4);
++  return v;
++}
++
++// A float channel to 8 bits, clamped to [0, 1] (NaN as 0).
++uint32_t Unorm8(float v) {
++  if (!(v > 0.0f)) return 0;
++  if (v >= 1.0f) return 255;
++  return uint32_t(v * 255.0f + 0.5f);
++}
++
++// Floating-point formats: channels clamped to [0, 1]; channels a format
++// lacks read as 1, as Direct3D samples them.
++uint32_t DecodeFloatPixel(const uint8_t* p, Format f) {
++  float ch[4] = {1.0f, 1.0f, 1.0f, 1.0f};  // R, G, B, A
++  int n = 0;
++  bool half = false;
++  switch (f) {
++    case Format::R16F: n = 1; half = true; break;
++    case Format::G16R16F: n = 2; half = true; break;
++    case Format::A16B16G16R16F: n = 4; half = true; break;
++    case Format::R32F: n = 1; break;
++    case Format::G32R32F: n = 2; break;
++    case Format::A32B32G32R32F: n = 4; break;
++    default: return 0xFFFF00FFu;
++  }
++  for (int i = 0; i < n; i++) {
++    if (half) {
++      uint16_t h;
++      std::memcpy(&h, p + 2 * i, 2);
++      ch[i] = HalfToFloat(h);
++    } else {
++      std::memcpy(&ch[i], p + 4 * i, 4);
++    }
++  }
++  return Unorm8(ch[3]) << 24 | Unorm8(ch[0]) << 16 | Unorm8(ch[1]) << 8 | Unorm8(ch[2]);
++}
++
+ uint32_t DecodePixel(const uint8_t* p, Format f) {
++  switch (f) {
++    case Format::R16F: case Format::G16R16F: case Format::A16B16G16R16F:
++    case Format::R32F: case Format::G32R32F: case Format::A32B32G32R32F:
++      return DecodeFloatPixel(p, f);
++    default: break;
++  }
+   uint32_t v = RawPixel(p, f);
+   switch (f) {
+     case Format::A8R8G8B8: return v;
+diff --git a/src/x86/sse.cpp b/src/x86/sse.cpp
+index 19e4386..3167e33 100644
+--- a/src/x86/sse.cpp
++++ b/src/x86/sse.cpp
+@@ -373,6 +373,26 @@ uint32_t RsqrtLane(uint32_t x) {
+   }
+ }
+ 
++uint32_t RcpLane(uint32_t x) {
++  const uint32_t sign = x & 0x80000000u, exp = (x >> 23) & 0xFF, frac = x & 0x7FFFFF;
++  if (exp == 0xFF && frac) return x | 0x00400000u;  // NaN: quieted
++  if (exp == 0) return sign | 0x7F800000u;          // ±0, denormal: ±inf
++  if (exp == 0xFF) return sign;                     // ±inf: ±0
++  const uint_fast8_t mode = softfloat_roundingMode, flags = softfloat_exceptionFlags;
++  softfloat_roundingMode = softfloat_round_near_even;
++  uint32_t r = f32_div(float32_t{0x3F800000u}, float32_t{x}).v;
++  softfloat_roundingMode = mode;
++  softfloat_exceptionFlags = flags;
++  if (((r >> 23) & 0xFF) == 0) return sign;  // denormal result: ±0
++  return r;
++}
++
++void Rcp(Xmm& d, const Xmm& s) {
++  Xmm r;
++  for (int i = 0; i < 4; i++) SetLane<uint32_t>(r, i, RcpLane(Lane<uint32_t>(s, i)));
++  d = r;
++}
++
+ void Rsqrt(Xmm& d, const Xmm& s) {
+   Xmm r;
+   for (int i = 0; i < 4; i++) SetLane<uint32_t>(r, i, RsqrtLane(Lane<uint32_t>(s, i)));
+diff --git a/src/x86/sse.h b/src/x86/sse.h
+index 3622a7a..6a2ce0c 100644
+--- a/src/x86/sse.h
++++ b/src/x86/sse.h
+@@ -14,6 +14,7 @@
+ // 1/sqrt(x), within the bound and the same on every host (and what a
+ // native replacement computes). tests/x86/sse_rsqrt_test checks it
+ // exhaustively; the bit-for-bit oracle against the host skips it.
++// RCPPS likewise: the correctly rounded 1/x (tests/x86/sse_rcp_test).
+ //
+ // Only the forms the supported games use are implemented; the lifter
+ // reports the rest as unimplemented.
+@@ -84,6 +85,13 @@ void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va);
+ void Rsqrt(Xmm& d, const Xmm& s);
+ uint32_t RsqrtLane(uint32_t x);
+ 
++// RCPPS: d = 1/s in all four float lanes, correctly rounded (see above).
++// No flags. As on the hardware, denormal operands count as ±0 (±inf) and
++// results too small for a normal float flush to ±0; ±inf gives ±0, NaNs
++// are quieted.
++void Rcp(Xmm& d, const Xmm& s);
++uint32_t RcpLane(uint32_t x);
++
+ // CVTSI2SD: the low lane of d = (double)v (always exact).
+ void Cvtsi2sd(Xmm& d, int32_t v);
+ 
+@@ -113,6 +121,11 @@ void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va);
+ // int32, 0x80000000 for NaN and out of range (invalid).
+ void CvtToDq(Ctx& c, bool dbl, bool truncate, Xmm& d, const Xmm& s, uint64_t va);
+ 
++// RCPSS: the low lane of d = 1/(the low lane of s), as RcpLane.
++inline void RcpSs(Xmm& d, const Xmm& s) {
++  SetLane<uint32_t>(d, 0, RcpLane(Lane<uint32_t>(s, 0)));
++}
++
+ // RSQRTSS: the low lane of d = 1/sqrt(the low lane of s), as RsqrtLane.
+ inline void RsqrtSs(Xmm& d, const Xmm& s) {
+   SetLane<uint32_t>(d, 0, RsqrtLane(Lane<uint32_t>(s, 0)));
+diff --git a/tests/x86/CMakeLists.txt b/tests/x86/CMakeLists.txt
+index 6f096e8..0029947 100644
+--- a/tests/x86/CMakeLists.txt
++++ b/tests/x86/CMakeLists.txt
+@@ -26,6 +26,12 @@ target_link_libraries(sse_rsqrt_test PRIVATE recomp_x87)
+ target_compile_options(sse_rsqrt_test PRIVATE -O2)
+ add_test(NAME sse_rsqrt COMMAND sse_rsqrt_test)
+ set_tests_properties(sse_rsqrt PROPERTIES TIMEOUT 300)
++# sse_rcp_test: RCPPS is the correctly rounded 1/x.
++add_executable(sse_rcp_test sse_rcp_test.cpp)
++target_link_libraries(sse_rcp_test PRIVATE recomp_x87)
++target_compile_options(sse_rcp_test PRIVATE -O2)
++add_test(NAME sse_rcp COMMAND sse_rcp_test)
++set_tests_properties(sse_rcp PROPERTIES TIMEOUT 300)
+ 
+ # hle_abi_test: HLE argument order under the Win64 and System V ABIs.
+ add_executable(hle_abi_test hle_abi_test.cpp)
+diff --git a/tests/x86/sse_rcp_test.cpp b/tests/x86/sse_rcp_test.cpp
+new file mode 100644
+index 0000000..233be12
+--- /dev/null
++++ b/tests/x86/sse_rcp_test.cpp
+@@ -0,0 +1,83 @@
++// sse::RcpLane (RCPPS) is the correctly rounded 1/x (see sse.h).
++//
++// - Every normal significand at one exponent (1 <= x < 2; the rest follows
++//   from rcp(2x) = rcp(x) / 2 away from the flush threshold): the result is
++//   checked against the two midpoints around it with exact integer
++//   arithmetic, independent of SoftFloat.
++// - The architectural error bound, |rel. error| <= 1.5 * 2^-12.
++// - Special operands: ±0, denormals, ±inf, NaNs, and results that flush.
++
++#include <cmath>
++#include <cstdarg>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include "x86/sse.h"
++
++namespace recomp {
++void FatalF(const char* fmt, ...) {  // x86/sse.cpp's #XM
++  va_list ap;
++  va_start(ap, fmt);
++  std::vprintf(fmt, ap);
++  va_end(ap);
++  std::abort();
++}
++}  // namespace recomp
++
++namespace {
++
++int g_fail = 0;
++
++void Fail(const char* what, uint32_t x, uint32_t got) {
++  if (++g_fail <= 20) std::printf("FAIL %s: x=%08X got %08X\n", what, x, got);
++}
++
++float F(uint32_t b) {
++  float f;
++  std::memcpy(&f, &b, 4);
++  return f;
++}
++
++}  // namespace
++
++int main() {
++  using recomp::sse::RcpLane;
++  // 1 <= x < 2 (exponent 127): x = mx * 2^-23, r = mr * 2^(er-150).
++  for (uint32_t frac = 0; frac < 0x800000u; frac++) {
++    uint32_t x = 0x3F800000u | frac;
++    uint32_t r = RcpLane(x);
++    uint64_t mx = 0x800000u | frac;
++    uint32_t er = (r >> 23) & 0xFF;
++    uint64_t mr = (r & 0x7FFFFF) | 0x800000u;
++    // r * x == mr * mx * 2^(er - 150 - 23); 1 == 2^0. Midpoints: (2mr ± 1)
++    // (the lower one 2mr - 1/2 at a power of two) in units of 2^(er-151).
++    int shift = -(int(er) - 151 - 23);  // 1 in units of 2^(er-151-23)
++    unsigned __int128 one = static_cast<unsigned __int128>(1) << shift;
++    unsigned __int128 lo2 = 4 * mr - (mr == 0x800000u ? 1 : 2), hi2 = 4 * mr + 2;  // x2 units
++    if (lo2 * mx > 2 * one || hi2 * mx < 2 * one) Fail("rounding", x, r);
++    double rel = std::fabs(double(F(r)) * double(F(x)) - 1.0);
++    if (rel > 1.5 / 4096) Fail("bound", x, r);
++  }
++  // Specials.
++  struct {
++    uint32_t x, want;
++  } cases[] = {
++      {0x00000000u, 0x7F800000u}, {0x80000000u, 0xFF800000u},  // ±0 -> ±inf
++      {0x00000001u, 0x7F800000u}, {0x807FFFFFu, 0xFF800000u},  // denormal -> ±inf
++      {0x7F800000u, 0x00000000u}, {0xFF800000u, 0x80000000u},  // ±inf -> ±0
++      {0x7F800001u, 0x7FC00001u}, {0xFFC00000u, 0xFFC00000u},  // NaN quieted
++      {0x7F7FFFFFu, 0x00000000u}, {0xFF000000u, 0x80000000u},  // tiny result: flush
++      {0x3F800000u, 0x3F800000u}, {0x40000000u, 0x3F000000u},  // 1, 2
++      {0xC0800000u, 0xBE800000u},                              // -4
++  };
++  for (auto t : cases)
++    if (RcpLane(t.x) != t.want) Fail("special", t.x, RcpLane(t.x));
++  if (g_fail) {
++    std::printf("%d failures\n", g_fail);
++    return 1;
++  }
++  std::printf("sse_rcp: ok\n");
++  return 0;
++}
+diff --git a/tools/lifter_x86/emit.cpp b/tools/lifter_x86/emit.cpp
+index f73425f..37b583d 100644
+--- a/tools/lifter_x86/emit.cpp
++++ b/tools/lifter_x86/emit.cpp
+@@ -1696,6 +1696,18 @@ void InsnEmitter::EmitSse() {
+             s.c_str(), va.c_str()));
+       return;
+     }
++    case ZYDIS_MNEMONIC_RCPPS: {
++      if (!IsXmm(0)) return Unimpl();
++      std::string s = src(1);
++      L(Fmt("::recomp::sse::Rcp(%s, %s);", XmmRef(0).c_str(), s.c_str()));
++      return;
++    }
++    case ZYDIS_MNEMONIC_RCPSS: {
++      if (!IsXmm(0)) return Unimpl();
++      std::string s = src(1);
++      L(Fmt("::recomp::sse::RcpSs(%s, %s);", XmmRef(0).c_str(), s.c_str()));
++      return;
++    }
+     case ZYDIS_MNEMONIC_RSQRTPS: {
+       if (!IsXmm(0)) return Unimpl();
+       std::string s = src(1);
+diff --git a/tools/lifter_x86/function.cpp b/tools/lifter_x86/function.cpp
+index 11c251d..c17b1c5 100644
+--- a/tools/lifter_x86/function.cpp
++++ b/tools/lifter_x86/function.cpp
+@@ -466,10 +466,45 @@ bool RecoverJumpTable(const Program& p, const Function& f, const Insn& jmp,
+       continue;
+     }
+     if (in->d.mnemonic != ZYDIS_MNEMONIC_CMP ||
+-        o0.type != ZYDIS_OPERAND_TYPE_REGISTER || Full(o0.reg.value) != Full(r) ||
+-        o1.type != ZYDIS_OPERAND_TYPE_IMMEDIATE || o1.imm.value.u >= 4096)
++        o0.type != ZYDIS_OPERAND_TYPE_REGISTER || Full(o0.reg.value) != Full(r))
+       return false;
+-    uint32_t cases = static_cast<uint32_t>(o1.imm.value.u) + 1;
++    uint64_t bound;
++    if (o1.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
++      bound = o1.imm.value.u;
++    } else if (o1.type == ZYDIS_OPERAND_TYPE_REGISTER) {
++      // The bound in a register set just before: `mov reg, imm` or
++      // `push imm; pop reg` (MSVC's short form for small constants).
++      const ZydisRegister b = Full(o1.reg.value);
++      const Insn* w = in;
++      bool found = false;
++      for (int k = 0; k < 16 && !found; k++) {
++        w = Before(f, w->va);
++        if (!w || w->d.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE) return false;
++        if (!WritesReg(*w, b)) continue;
++        const auto& w0 = w->ops[0];
++        const auto& w1 = w->ops[1];
++        if (w->d.mnemonic == ZYDIS_MNEMONIC_MOV && w0.type == ZYDIS_OPERAND_TYPE_REGISTER &&
++            Full(w0.reg.value) == b && w1.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
++          bound = w1.imm.value.u;
++          found = true;
++        } else if (w->d.mnemonic == ZYDIS_MNEMONIC_POP &&
++                   w0.type == ZYDIS_OPERAND_TYPE_REGISTER && Full(w0.reg.value) == b) {
++          const Insn* push = Before(f, w->va);
++          if (!push || push->d.mnemonic != ZYDIS_MNEMONIC_PUSH ||
++              push->ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
++            return false;
++          bound = push->ops[0].imm.value.u;
++          found = true;
++        } else {
++          return false;
++        }
++      }
++      if (!found) return false;
++    } else {
++      return false;
++    }
++    if (bound >= 4096) return false;
++    uint32_t cases = static_cast<uint32_t>(bound) + 1;
+     if (two_level) {
+       // A byte index table picks the entry.
+       if (!in_text(index, cases)) return false;
 diff --git a/tools/lifter_x86/main.cpp b/tools/lifter_x86/main.cpp
-index cc4778c..3bd98fa 100644
+index cc4778c..a4a04d8 100644
 --- a/tools/lifter_x86/main.cpp
 +++ b/tools/lifter_x86/main.cpp
-@@ -205,7 +205,7 @@ int main(int argc, char** argv) {
+@@ -31,6 +31,7 @@
+ // consistently. Then the functions are emitted into generated/gen_NNN.cpp
+ // plus a table file.
+ 
++#include <algorithm>
+ #include <cctype>
+ #include <cstdio>
+ #include <deque>
+@@ -205,7 +206,7 @@ int main(int argc, char** argv) {
    std::set<uint64_t> done;
    size_t from_code_ptrs = 0, from_data_ptrs = 0;
    auto candidate = [&](const lifter::Module* m, uint64_t t, size_t* counter) {
@@ -289,6 +2020,52 @@ index cc4778c..3bd98fa 100644
      lifter::Insn in;
      if (!dec.Decode(p, t, &in)) return;
      p.entries.insert(t);
+@@ -223,7 +224,7 @@ int main(int argc, char** argv) {
+         for (uint64_t a = lo; a + 4 <= hi; a += 4)
+           candidate(&m, p.mem.read<uint32_t>(a), &from_data_ptrs);
+     }
+-  size_t recovered_tables = 0;
++  size_t recovered_tables = 0, merged_tables = 0;
+   while (!work.empty()) {
+     uint64_t e = work.front();
+     work.pop_front();
+@@ -236,9 +237,23 @@ int main(int argc, char** argv) {
+       more = false;
+       for (const auto& [va, in] : f.insns) {
+         std::vector<uint64_t> targets;
+-        if (p.jumptables.count(va) ||
+-            !lifter::RecoverJumpTable(p, f, in, &targets))
++        if (!lifter::RecoverJumpTable(p, f, in, &targets)) continue;
++        // Ghidra sometimes lists only some of a table's targets: merge in
++        // the ones the recovery reads from the table itself.
++        auto it = p.jumptables.find(va);
++        if (it != p.jumptables.end()) {
++          bool grew = false;
++          for (uint64_t t : targets)
++            if (std::find(it->second.begin(), it->second.end(), t) == it->second.end()) {
++              it->second.push_back(t);
++              grew = true;
++            }
++          if (grew) {
++            merged_tables++;
++            more = true;
++          }
+           continue;
++        }
+         p.jumptables[va] = std::move(targets);
+         recovered_tables++;
+         more = true;
+@@ -274,8 +289,8 @@ int main(int argc, char** argv) {
+               "%zu via code pointers, %zu via data pointers; %zu weak)\n",
+               p.entries.size(), initial, p.entries.size() - initial,
+               from_code_ptrs, from_data_ptrs, p.weak.size());
+-  std::printf("jump tables: %zu from Ghidra, %zu recovered\n",
+-              p.jumptables.size() - recovered_tables, recovered_tables);
++  std::printf("jump tables: %zu from Ghidra (%zu completed), %zu recovered\n",
++              p.jumptables.size() - recovered_tables, merged_tables, recovered_tables);
+ 
+   // Pass 2: final CFGs and emission.
+   std::filesystem::create_directories(outdir);
 diff --git a/tools/lifter_x86/program.cpp b/tools/lifter_x86/program.cpp
 index 0bd1b03..5e08f43 100644
 --- a/tools/lifter_x86/program.cpp
