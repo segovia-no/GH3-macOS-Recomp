@@ -267,7 +267,8 @@ Gameplay fps (between profiler windows; macOS `sample` pauses the game, so the 5
 | `083be42` | 15-18 | (Havok fixed; menus already ~120) |
 | `09028bb` | 35-60 | SSE add/sub/mul/div + conversions: host fast path in sse.cpp (was SoftFloat, ~55% of the main thread) |
 | `d925878`, `9b91ad8` | 47-89 | fast paths inlined into lifted code (`x86/sse_fast.h`), sqrt and min/max, sticky-PE skip, GPU submissions pipelined (64 in flight, 256 MB staging cap) |
-| `8c89c7d` | **62-104** (mostly 65-100) | fast paths force-inlined (the compiler had declined in the biggest functions); RSQRTPS/RCPPS fast exact lanes |
+| `8c89c7d` | 62-104 (mostly 65-100) | fast paths force-inlined (the compiler had declined in the biggest functions); RSQRTPS/RCPPS fast exact lanes |
+| `97232fa` | **120, vsync-capped** (median frame 8.33 ms, p99 mostly < 9 ms) | native skinning (0x61c590), bit-identical to the original |
 
 - Every fast path gives the exact model's bits and MXCSR flags. `tests/x86/sse_fast_test` fuzzes each against the SoftFloat path (rsqrt/rcp exhaustively over significands). Planted mutations are caught, except the rsqrt midpoint margin, which the exhaustive test shows never fires.
 - What remains on the main thread (`work/prof/t57.txt`, 8c89c7d):
