@@ -66,6 +66,7 @@ manifests/               lifter input: overrides (hand-written), noentry and lif
 scripts/setup/           the pipeline steps setup.sh runs
 scripts/dev/             running and debugging (play.sh, boot.sh), manifest generators, Ghidra (ghidra_analyze.sh and scripts)
 packaging/macos/         make_app.sh and its helpers
+packaging/builder/       experimental: GH3 Builder.app and its kit (docs/notes/04-builder-spike.md)
 docs/                    guides, developer docs, technical notes, extracted tables
 third_party/SwARc/       (gitignored) the SwARc checkout
 build/                   (gitignored) everything generated from your copy of the game

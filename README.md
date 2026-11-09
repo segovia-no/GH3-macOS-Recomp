@@ -22,7 +22,7 @@ cd GH3-macOS-Recomp
 open "build/Guitar Hero III.app"
 ```
 
-`setup.sh` installs the Homebrew packages it needs, analyses and translates the game, and builds `build/Guitar Hero III.app`. The first run takes about 20 minutes (M3 Pro); later runs only redo what changed. Drag the app to Applications if you like. Details are in the **[install guide](docs/guides/install.md)**.
+`setup.sh` installs the Homebrew packages it needs, translates the game, and builds `build/Guitar Hero III.app`. The first run takes about 18 minutes (M3 Pro); later runs only redo what changed. Drag the app to Applications if you like. Details are in the **[install guide](docs/guides/install.md)**.
 
 ## What works
 - Intro movies, menus, and playing songs. Tested in quickplay with the keyboard and with a wireless guitar; other modes have not been checked one by one.

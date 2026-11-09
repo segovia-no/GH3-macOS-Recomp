@@ -213,7 +213,7 @@ Each line is the fatal stop after the previous fix. `scripts/dev/boot.sh`.
 
 ## Running state (observed)
 
-- Boot to intro movies (Activision, RedOctane, Neversoft, intro) via Bink frame buffers + GH3's YUV shader on Metal, then the title screen ("PRESS ANY BUTTON TO ROCK"), then BetterGH3's menus. `docs/screenshots/intro-movie.png`.
+- Boot to intro movies (Activision, RedOctane, Neversoft, intro) via Bink frame buffers + GH3's YUV shader on Metal, then the title screen ("PRESS ANY BUTTON TO ROCK"), then BetterGH3's menus.
 - BetterGH3's QB patches run unchanged (its custom "Try allowing Guitar Hero III through Firewall" online string appears).
 - Online: with `AutoLogin=PROMPT` (default) the game asks to log in and, offline, ends on the online error dialog. `AutoLogin=OFF` in `~/Library/Application Support/gh3/AspyrConfig.ini` (values PROMPT/ON/OFF, strings in GH3.exe) skips it; the game then shows the controller help screen ("In the event of rock", continue = green).
 - Input: test input (`GH3_TEST_INPUT`) keys reach the game (Return starts/skips). The keyboard fret mapping is not worked out yet (F1 did not act as green); XDinput/guitar input is the next input task.
