@@ -48,7 +48,42 @@ final class BuildModel: ObservableObject {
   private var activity: NSObjectProtocol?
   private var doneApp: URL?
 
-  var kit: URL { Bundle.main.resourceURL!.appendingPathComponent("kit") }
+  var bundledKit: URL { Bundle.main.resourceURL!.appendingPathComponent("kit") }
+  var licenses: URL { bundledKit.appendingPathComponent("licenses") }
+
+  // The kit runs from a copy in ~/Library/Caches without the quarantine
+  // flag (xattr -dr): a downloaded app's files all carry it, and
+  // Gatekeeper would stop each of the kit's tools. Approving the app once
+  // (Open Anyway) covers what it brings. Refreshed when its config changes.
+  private func runnableKit() throws -> URL {
+    let fm = FileManager.default
+    let cache = fm.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Caches/GH3-macOS-Recomp")
+    let dest = cache.appendingPathComponent("kit")
+    let stamp = bundledKit.appendingPathComponent("config.sh")
+    if let a = try? Data(contentsOf: stamp),
+       let b = try? Data(contentsOf: dest.appendingPathComponent("config.sh")), a == b {
+      return dest
+    }
+    try? fm.removeItem(at: dest)
+    try fm.createDirectory(at: cache, withIntermediateDirectories: true)
+    let copied = try run("/usr/bin/ditto", [bundledKit.path, dest.path])
+    let cleared = try run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", dest.path])
+    guard copied == 0, cleared == 0 else {
+      throw NSError(domain: "GH3Builder", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Could not prepare the build kit in \(cache.path)"])
+    }
+    return dest
+  }
+
+  private func run(_ tool: String, _ args: [String]) throws -> Int32 {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: tool)
+    p.arguments = args
+    try p.run()
+    p.waitUntilExit()
+    return p.terminationStatus
+  }
 
   var gameValid: Bool {
     guard let g = gameDir else { return false }
@@ -114,6 +149,14 @@ final class BuildModel: ObservableObject {
     activity = ProcessInfo.processInfo.beginActivity(
       options: [.userInitiated, .idleSystemSleepDisabled], reason: "Building Guitar Hero III")
 
+    let kit: URL
+    do {
+      kit = try runnableKit()
+    } catch {
+      log.append("error: \(error.localizedDescription)")
+      finished(status: -1)
+      return
+    }
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/bash")
     p.arguments = [kit.appendingPathComponent("build_game.sh").path, game.path, outDir.path]
@@ -288,7 +331,7 @@ struct ContentView: View {
       }
       .background(Color(nsColor: .textBackgroundColor))
       .clipShape(RoundedRectangle(cornerRadius: 6))
-      .onChange(of: m.log.count) { _ in proxy.scrollTo("end") }
+      .onChange(of: m.log.count) { proxy.scrollTo("end") }
     }
   }
 
@@ -298,6 +341,8 @@ struct ContentView: View {
         Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([app]) }
         Button("Play Guitar Hero III") { NSWorkspace.shared.open(app) }.keyboardShortcut(.defaultAction)
       }
+      Button("Licenses") { NSWorkspace.shared.open(m.licenses) }
+        .buttonStyle(.link)
       Spacer()
       if m.state == .running {
         Button("Cancel") { m.cancel() }

@@ -22,6 +22,8 @@ cd GH3-macOS-Recomp
 open "build/Guitar Hero III.app"
 ```
 
+Prefer an app? Each [release](https://github.com/segovia-no/GH3-macOS-Recomp/releases) has **GH3 Builder** (experimental, macOS 26+), which builds the game without Homebrew or the terminal: see the [install guide](docs/guides/install.md#the-easy-way-gh3-builder-experimental).
+
 `setup.sh` installs the Homebrew packages it needs, translates the game, and builds `build/Guitar Hero III.app`. The first run takes about 18 minutes (M3 Pro); later runs only redo what changed. Drag the app to Applications if you like. Details are in the **[install guide](docs/guides/install.md)**.
 
 ## What works

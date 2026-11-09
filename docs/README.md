@@ -13,7 +13,7 @@
 - [notes/01-research.md](notes/01-research.md): prior art. Existing GH3 reverse-engineering, mod and port projects, and what each offers this port.
 - [notes/02-decomp-crossref.md](notes/02-decomp-crossref.md): naming PC `GH3.exe` from the other projects (the QB C-function table, RTTI, GH3+ symbols), with each project's license.
 - [notes/03-porting-log.md](notes/03-porting-log.md): the development log. Lifter coverage, the boot sequence, the CRT, AWL, Bink, input, performance (SSE fast paths, native skinning), audio, controllers, packaging.
-- [notes/04-builder-spike.md](notes/04-builder-spike.md): an experimental builder app that builds the game with only Apple's Command Line Tools, and what remains before it can be shared.
+- [notes/04-builder-spike.md](notes/04-builder-spike.md): GH3 Builder, the app that builds the game with only Apple's Command Line Tools: how it works, its licensing (LGPL FFmpeg, notices, sources) and what is still open.
 - [data/](data/): tables extracted from the executable:
   - `cfuncs.tsv`, `cmemberfuncs.tsv`: the QB script-function tables;
   - `gh3plus_symbols.tsv`: addresses named by GH3+ and related projects;

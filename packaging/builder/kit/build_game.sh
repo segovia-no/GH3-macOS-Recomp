@@ -144,6 +144,7 @@ rm -rf "$app"
 mkdir -p "$contents/MacOS" "$contents/Resources"
 cp "$work/gh3" "$contents/MacOS/gh3"
 cp -R "$kit/Frameworks" "$contents/Frameworks"
+cp -R "$kit/licenses" "$contents/Resources/licenses"  # NOTICES.md: what the app carries
 
 # The runtime's own files in the game folder: the original GH3.exe, the
 # unpacked FMOD, the lifted CRT DLLs, and an empty PLUGINS (src/plugins.cpp).
@@ -197,7 +198,7 @@ cat > "$contents/Info.plist" <<PLIST
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.music-games</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>

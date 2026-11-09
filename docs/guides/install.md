@@ -3,14 +3,23 @@
 The app is built on your Mac from your own copy of the game. There is no download with the game in it.
 
 ## Requirements
-- A Mac with **Apple Silicon** (M1 or later). It was developed on macOS 26; the app is marked for macOS 13 and later, but older versions are untested.
+- A Mac with **Apple Silicon** (M1 or later) running **macOS 26** or later. The libraries the app bundles are built for macOS 26.
 - **Your own Guitar Hero III: Legends of Rock installation for PC** (version 1.3.1): the folder with `GH3.exe`, `DATA/`, `AWL.dll` and `fmodex.dll`. We recommend starting from a [BetterGH3](https://github.com/lunalawl/BetterGH3) installation, which is the one this port was developed and tested with. The build is made for one specific `GH3.exe` (SHA-256 `4322a71d…5e804`, see [docs/README.md](../README.md)), and setup stops if yours differs.
 - The **Xcode Command Line Tools**: `xcode-select --install`.
 - **Homebrew** ([brew.sh](https://brew.sh)). Setup installs the packages it needs: cmake, ninja, sdl3, ffmpeg, llvm@22, glslang, spirv-cross, sevenzip, upx and libusb.
 - Disk space: about 2.6 GB (`build/` 1.7 GB, `third_party/SwARc` 0.9 GB). The game folder itself is linked, not copied.
 - An internet connection during setup. It clones SwARc from GitHub and downloads Microsoft's Visual C++ 2005 SP1 redistributable, whose runtime DLLs the game was built against.
 
-## Building the app
+## The easy way: GH3 Builder (experimental)
+Each [release](https://github.com/segovia-no/GH3-macOS-Recomp/releases) has **GH3 Builder**, an app that builds the game on your Mac without Homebrew or the terminal. You need macOS 26 or later and Apple's Xcode Command Line Tools; the builder offers to install the tools if they are missing.
+1. Download `GH3-Builder-<version>-macOS26-arm64.zip` and unzip it.
+2. Open **GH3 Builder**. The first time, macOS stops it because it is not notarized: open System Settings → Privacy & Security, click **Open Anyway** next to "GH3 Builder", and confirm.
+3. Choose your Guitar Hero III folder and where to put the app (default: `~/Applications`), then click **Build**. The first build takes about 15 minutes.
+4. Click **Play**.
+
+The builder holds nothing from the game. Its Licenses button lists the open-source components inside it. It keeps its work files in `~/Library/Caches/GH3-macOS-Recomp`, so building again after an update is quick.
+
+## Building the app from source
 ```sh
 git clone https://github.com/segovia-no/GH3-macOS-Recomp.git
 cd GH3-macOS-Recomp

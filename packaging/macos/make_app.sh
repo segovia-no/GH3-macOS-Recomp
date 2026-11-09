@@ -93,7 +93,7 @@ cat > "$contents/Info.plist" <<PLIST
   <key>CFBundleShortVersionString</key><string>$(git -C "$root" describe --tags --always | sed 's/^v//')</string>
   <key>CFBundleVersion</key><string>$(git -C "$root" rev-list --count HEAD)</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.music-games</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>

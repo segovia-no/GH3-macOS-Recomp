@@ -18,7 +18,11 @@ First playable release. Source only: the game is built on your Mac from your own
 - Only the `GH3.exe` from a BetterGH3 installation is supported (SHA-256 `4322a71d…5e804`).
 - GH3+ plugins don't load (the plugin loader is replaced by a stub).
 - Untested: online play, tilt for Star Power, Xbox 360 gamepads on the receiver and rumble, other gamepads (through SDL), and game modes other than quickplay.
-- Experimental, not yet shareable: `packaging/builder` (GH3 Builder.app), which builds the game with only Apple's Command Line Tools. See [docs/notes/04-builder-spike.md](docs/notes/04-builder-spike.md).
+- Requires macOS 26 or later: the bundled libraries are built for it.
+
+### GH3 Builder (experimental)
+- An app that builds the game with only Apple's Command Line Tools: no Homebrew, no terminal. It is attached to the release (`GH3-Builder-0.1.0-macOS26-arm64.zip`, Apple Silicon, macOS 26+). It isn't notarized, so allow it once with Open Anyway.
+- It holds nothing from the game. Its open-source components are listed in its `licenses/NOTICES.md`, with the LGPL FFmpeg built for it. The LGPL and GPL sources are attached as `GH3-Builder-0.1.0-sources.tar`. Details: [docs/notes/04-builder-spike.md](docs/notes/04-builder-spike.md).
 
 ### Built on
 - [SwARc](https://github.com/JTM-rootstorm/SwARc) at [`gh3-v0.1.0`](https://github.com/segovia-no/SwARc/tree/gh3-v0.1.0) on our fork (`4a7ec39`).
