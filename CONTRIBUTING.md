@@ -24,8 +24,8 @@ Small, focused pull requests are easiest to review. For larger changes, open an 
 ### Where changes go
 | Change | Where |
 |---|---|
-| Behaviour of a Windows API, DirectX or middleware (Bink, FMOD's DirectSound path, XInput, ...) | SwARc, in `third_party/SwARc`; save it as `patches/swarc-gh3.patch` (`git diff HEAD > ../../patches/swarc-gh3.patch` there, with new files `git add -N`'d first). SwARc's own rules apply: nothing game-specific in it. |
-| Lifter fixes (new instructions, function discovery) | SwARc's lifter, same patch. Re-lift (`scripts/setup/lift.sh`) and diff `build/generated` before and after. |
+| Behaviour of a Windows API, DirectX or middleware (Bink, FMOD's DirectSound path, XInput, ...) | SwARc, in `third_party/SwARc`: commit on its `gh3` branch, open a pull request to [segovia-no/SwARc](https://github.com/segovia-no/SwARc), and point `SWARC_COMMIT` in `scripts/setup/common.sh` at it (see [building.md](docs/dev/building.md#changing-swarc)). SwARc's own rules apply: nothing game-specific in it, signed commits. |
+| Lifter fixes (new instructions, function discovery) | SwARc's lifter, the same way. Re-lift (`scripts/setup/lift.sh`) and diff `build/generated` before and after. |
 | Game-specific code: replacements of game functions, stubs for the game's DLLs, configuration | `src/`, plus `manifests/overrides.manifest` for `replace`/`entry`/`noentry` lines. Regenerate `manifests/lifter.manifest` with `scripts/dev/gen_manifest.py`. |
 | Build, packaging | `scripts/setup/`, `packaging/macos/`, `CMakeLists.txt` |
 

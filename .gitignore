@@ -19,7 +19,7 @@
 /build/
 *.app/
 
-# SwARc checkout (fetched and patched by scripts/setup/fetch_swarc.sh) and
+# SwARc checkout (fetched by scripts/setup/fetch_swarc.sh) and
 # optional reference clones used while researching (docs/notes).
 /third_party/
 /ref/

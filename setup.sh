@@ -2,9 +2,9 @@
 # GH3-macOS-Recomp: builds Guitar Hero III (PC) for macOS from your own copy
 # of the game, from scratch to build/Guitar Hero III.app:
 #   1. checks the tools (Homebrew packages)
-#   2. SwARc: checkout, patch, lifter        scripts/setup/fetch_swarc.sh
+#   2. SwARc: checkout, lifter               scripts/setup/fetch_swarc.sh
 #   3. inputs: GH3.exe, fmodex.dll, the CRT  scripts/setup/prepare_inputs.sh
-#   4. analysis (Ghidra)                     scripts/setup/analyze.sh
+#   4. symbols                               scripts/setup/symbols.sh
 #   5. lift to C++                           scripts/setup/lift.sh
 #   6. build                                 scripts/setup/build.sh
 #   7. app bundle                            packaging/macos/make_app.sh
@@ -29,7 +29,7 @@ step "tools"
 [ "$(uname -s)-$(uname -m)" = "Darwin-arm64" ] || die "macOS on Apple Silicon only"
 command -v brew > /dev/null || die "Homebrew is needed: https://brew.sh"
 missing=()
-for f in cmake ninja sdl3 ffmpeg llvm@22 glslang spirv-cross ghidra sevenzip upx libusb; do
+for f in cmake ninja sdl3 ffmpeg llvm@22 glslang spirv-cross sevenzip upx libusb; do
   brew list --versions "$f" > /dev/null 2>&1 || missing+=("$f")
 done
 if [ ${#missing[@]} -gt 0 ]; then
@@ -40,7 +40,7 @@ command -v xcrun > /dev/null || die "Xcode Command Line Tools are needed: xcode-
 
 scripts/setup/fetch_swarc.sh
 scripts/setup/prepare_inputs.sh
-scripts/setup/analyze.sh
+scripts/setup/symbols.sh
 scripts/setup/lift.sh
 scripts/setup/build.sh
 packaging/macos/make_app.sh ${app_args[@]+"${app_args[@]}"}

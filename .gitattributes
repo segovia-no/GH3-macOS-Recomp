@@ -1,5 +1,4 @@
-# Shell scripts and patches: LF everywhere (a CRLF patch does not apply).
+# Shell scripts and the lifter's tables: LF everywhere.
 *.sh text eol=lf
-*.patch text eol=lf
 *.manifest text eol=lf
 *.tsv text eol=lf

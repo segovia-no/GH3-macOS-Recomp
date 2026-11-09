@@ -3,15 +3,15 @@
 ## The idea
 `GH3.exe` is a 32-bit x86 Windows program. Instead of emulating it, the port translates its machine code ahead of time into C++. Every x86 function becomes a C++ function that works on a model of the CPU state (registers, flags, the x87 FPU and SSE, both exact) and on the game's memory. That C++ is compiled for arm64 with clang. At run time there is no interpreter and no JIT. Code that was not lifted is a fatal error naming its address, never a slow fallback.
 
-The Windows side is reimplemented, not emulated. Each DLL function the game imports is a native handler (HLE). Kernel32, user32, Direct3D 9, DirectSound, DirectInput, XInput, Bink and the rest run on SDL3 and Metal. Both the lifter and this runtime come from [SwARc](https://github.com/JTM-rootstorm/SwARc). This repository is the game project on top of it, plus a patch to SwARc.
+The Windows side is reimplemented, not emulated. Each DLL function the game imports is a native handler (HLE). Kernel32, user32, Direct3D 9, DirectSound, DirectInput, XInput, Bink and the rest run on SDL3 and Metal. Both the lifter and this runtime come from [SwARc](https://github.com/JTM-rootstorm/SwARc). This repository is the game project on top of it; our changes to SwARc are on the `gh3` branch of [its fork](https://github.com/segovia-no/SwARc/tree/gh3).
 
 ```
 your GH3.exe ──┐
-fmodex.dll ────┼─ Ghidra ─► functions, jump tables ─┐
-CRT DLLs ──────┘                                    ├─ recomp_lift ─► build/generated/*.cpp ─┐
-manifests/ (names, replacements, noentry) ──────────┘                                       │
+fmodex.dll ────┼─ manifests/ghidra (functions, jump tables) ─┐
+CRT DLLs ──────┘                                            ├─ recomp_lift ─► build/generated/*.cpp ─┐
+manifests/ (names, replacements, noentry) ──────────────────┘                                       │
 src/ (native code for this game) ──────────────────────────────────────────────────────────┼─ clang ─► gh3 ─► Guitar Hero III.app
-SwARc runtime (Win32/D3D9/... on SDL3 + Metal, with patches/swarc-gh3.patch) ───────────────┘
+SwARc runtime (Win32/D3D9/... on SDL3 + Metal, the gh3 branch) ───────────────────────────┘
 ```
 
 ## What is lifted
@@ -31,8 +31,8 @@ SwARc runtime (Win32/D3D9/... on SDL3 + Metal, with patches/swarc-gh3.patch) ─
 
 `manifests/overrides.manifest` wires these in. `replace <va> <name>` swaps a lifted function for native code; the lifted body stays available as `f_<VA>_lifted`, the reference for checking a replacement.
 
-## SwARc changes (`patches/swarc-gh3.patch`)
-Generic changes, nothing specific to GH3, kept as one patch against the tested SwARc commit:
+## SwARc changes (the `gh3` branch)
+Generic changes, nothing specific to GH3, as commits on [segovia-no/SwARc](https://github.com/segovia-no/SwARc/tree/gh3)'s `gh3` branch, on top of upstream SwARc; `SWARC_COMMIT` in `scripts/setup/common.sh` pins the tested one:
 - **Lifter:**
   - multiple executable sections;
   - the `noentry` manifest directive;
@@ -61,12 +61,12 @@ The [porting log](../notes/03-porting-log.md) has the story and the measurements
 setup.sh                 the whole build, from your game folder to the app
 CMakeLists.txt           the game build (SwARc as a subdirectory, lifted code, src/)
 src/                     native code for this game (above)
-manifests/               lifter input: overrides (hand-written), noentry and lifter (generated), fmodex
-patches/                 swarc-gh3.patch, our changes to SwARc
+manifests/               lifter input: overrides (hand-written), noentry and lifter (generated), fmodex,
+                         ghidra/ (each module's functions and jump tables, from Ghidra)
 scripts/setup/           the pipeline steps setup.sh runs
-scripts/dev/             running and debugging (play.sh, boot.sh), manifest generators, Ghidra scripts
+scripts/dev/             running and debugging (play.sh, boot.sh), manifest generators, Ghidra (ghidra_analyze.sh and scripts)
 packaging/macos/         make_app.sh and its helpers
 docs/                    guides, developer docs, technical notes, extracted tables
-third_party/SwARc/       (gitignored) the patched SwARc checkout
+third_party/SwARc/       (gitignored) the SwARc checkout
 build/                   (gitignored) everything generated from your copy of the game
 ```

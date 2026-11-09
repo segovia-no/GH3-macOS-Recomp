@@ -8,7 +8,7 @@
 cmake_minimum_required(VERSION 3.25)
 project(GH3-macOS-Recomp CXX C)
 
-set(SWARC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SwARc" CACHE PATH "SwARc checkout (patched)")
+set(SWARC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SwARc" CACHE PATH "SwARc checkout (the gh3 branch)")
 set(GH3_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build/generated" CACHE PATH "recomp_lift output")
 if(NOT EXISTS "${SWARC_DIR}/CMakeLists.txt")
   message(FATAL_ERROR "No SwARc at ${SWARC_DIR}: run scripts/setup/fetch_swarc.sh (or ./setup.sh)")

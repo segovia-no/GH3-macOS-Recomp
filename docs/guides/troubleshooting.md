@@ -14,8 +14,7 @@ When reporting a problem, attach the log and the newest crash report. See [CONTR
 
 ## Setup
 - **"GH3.exe: unexpected SHA-256"**: the build is made for one specific `GH3.exe`, and the addresses in `manifests/` and `src/` belong to it. Other versions of the executable (for example an unmodified 1.3.1 without the GH3+ loader) are not supported yet.
-- **"patches/swarc-gh3.patch does not apply"**: `third_party/SwARc` has changes or a different patch applied (after a `git pull`, for example). Delete `third_party/SwARc` and run `./setup.sh` again.
-- **Ghidra fails**: see `build/logs/ghidra-*.log`. Ghidra from Homebrew needs openjdk@25, which `brew install ghidra` brings in.
+- **"third_party/SwARc has local changes and is not at …"**: the SwARc checkout was edited, or comes from an older version of this project (the SwARc patch). Delete `third_party/SwARc` and run `./setup.sh` again.
 - **The build fails**: see `build/logs/build.log`. The first build compiles very large generated files; give it time and memory.
 
 ## Starting the game

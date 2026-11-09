@@ -1,6 +1,6 @@
 # SwARc lifter manifest for GH3.exe (PC 1.3.1 with the GH3+ loader and the HATRED section).
 # Directives: entry|name|resume|setjmp|probe|replace <va> [name]
-# Function list comes from Ghidra (build/symbols/gh3/functions.tsv); this file
+# Function list comes from Ghidra (manifests/ghidra/gh3/functions.tsv); this file
 # holds overrides found while lifting and running; scripts/dev/gen_manifest.py
 # merges it with the extracted names into manifests/lifter.manifest.
 

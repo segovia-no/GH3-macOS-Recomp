@@ -9,7 +9,7 @@ All the setup scripts share `scripts/setup/common.sh`:
 |---|---|---|
 | `GH3_GAME_DIR` | `./Guitar Hero III` | your Guitar Hero III install (read only) |
 | `GH3_BUILD_DIR` | `./build` | everything generated (gitignored) |
-| `SWARC_DIR` | `./third_party/SwARc` | the patched SwARc checkout (gitignored) |
+| `SWARC_DIR` | `./third_party/SwARc` | the SwARc checkout (gitignored) |
 
 Layout of `build/`:
 
@@ -17,21 +17,21 @@ Layout of `build/`:
 |---|---|---|
 | `input/` | `prepare_inputs.sh` | `GH3.exe`, the unpacked `fmodex.dll`, `msvcr80.dll`, `msvcp80.dll` |
 | `gamedir/` | `prepare_inputs.sh` | the game folder the build runs: links to the install, plus the runtime's own copies of the files above and an empty `PLUGINS/` |
-| `symbols/<module>/` | `analyze.sh` | `pe_info.txt`, `imports.tsv`, `exports.tsv` (SwARc's `pe_symbols.py`); `functions.tsv`, `jumptables.tsv` (Ghidra) |
-| `ghidra/` | `analyze.sh` | the Ghidra projects (for looking around, or for `scripts/dev/ghidra/*.java`) |
+| `symbols/<module>/` | `symbols.sh` | `pe_info.txt`, `imports.tsv`, `exports.tsv` (SwARc's `pe_symbols.py`); `functions.tsv`, `jumptables.tsv` (copied from `manifests/ghidra/<module>`) |
+| `ghidra/` | `scripts/dev/ghidra_analyze.sh` | the Ghidra projects (for looking around, or for `scripts/dev/ghidra/*.java`) |
 | `generated/` | `lift.sh` | the lifted C++ (about 150 files, 290 MB) |
 | `cmake/` | `build.sh` | the CMake build; the game is `cmake/gh3` |
 | `Guitar Hero III.app` | `packaging/macos/make_app.sh` | the app bundle |
 | `logs/` | all | one log per step |
 
 ## The steps
-1. **`scripts/setup/fetch_swarc.sh`**: clones [SwARc](https://github.com/JTM-rootstorm/SwARc) at the tested commit (`SWARC_COMMIT` in `common.sh`) and applies `patches/swarc-gh3.patch` with `git apply --index`. Then it builds only the lifter: `cmake --preset release && cmake --build --preset release --target recomp_lift`.
+1. **`scripts/setup/fetch_swarc.sh`**: clones the `gh3` branch of [our SwARc fork](https://github.com/segovia-no/SwARc/tree/gh3) and checks out the tested commit (`SWARC_COMMIT` in `common.sh`); a checkout already past it is left alone. Then it builds only the lifter: `cmake --preset release && cmake --build --preset release --target recomp_lift`.
 2. **`scripts/setup/prepare_inputs.sh`**:
    - checks `GH3.exe`'s SHA-256;
    - UPX-unpacks `fmodex.dll` (`upx -d`, checked against a known hash);
    - downloads Microsoft's VC++ 2005 SP1 redistributable and extracts `msvcr80.dll`/`msvcp80.dll` 8.0.50727.6195 from it with `7zz` (exe → `vcredist.msi` → the CRT merge module), checking all hashes;
    - makes `build/gamedir`.
-3. **`scripts/setup/analyze.sh`**: for each module, SwARc's `tools/pe_symbols.py`, then Ghidra headless with SwARc's `ExportFunctions.java`/`ExportJumpTables.java`. A module is skipped if its `functions.tsv` exists.
+3. **`scripts/setup/symbols.sh`**: for each module, SwARc's `tools/pe_symbols.py`, plus the function and jump table lists from `manifests/ghidra` (see [Redoing the Ghidra analysis](#redoing-the-ghidra-analysis)).
 4. **`scripts/setup/lift.sh`**: `recomp_lift` on GH3.exe (with `manifests/lifter.manifest` and `--no-x87-doubles`). The three DLLs are lifted as modules, FMOD with `manifests/fmodex.manifest`. Output goes to `build/generated`.
 5. **`scripts/setup/build.sh`**: configures `CMakeLists.txt` into `build/cmake` (Ninja, RelWithDebInfo) and builds the `gh3` target. That builds SwARc's runtime libraries too.
 6. **`packaging/macos/make_app.sh [--embed-game]`**: rebuilds `gh3` if needed. Then it makes the app bundle:
@@ -61,12 +61,14 @@ Switches for `play.sh` (environment variables, passed through to the game):
 | `GH3_X360RX_TRACE=1` | log every packet from an Xbox 360 wireless receiver |
 
 ## Changing SwARc
-Work in `third_party/SwARc`; the patch is applied there with `--index`. To save your changes:
+Our SwARc changes are commits on the `gh3` branch of [segovia-no/SwARc](https://github.com/segovia-no/SwARc/tree/gh3), a fork of upstream SwARc. Setup leaves `third_party/SwARc` detached at `SWARC_COMMIT`. To change it:
 ```sh
 cd third_party/SwARc
-git add -N <new files>
-git diff HEAD > ../../patches/swarc-gh3.patch
+git switch gh3
+# edit, build (scripts/setup/build.sh), test, commit
+git push origin gh3        # or a pull request to segovia-no/SwARc
 ```
+Then set `SWARC_COMMIT` in `scripts/setup/common.sh` to the new commit and commit that here. While you work, `fetch_swarc.sh` uses a checkout that is ahead of `SWARC_COMMIT` as it is. To pick up upstream SwARc, rebase `gh3` onto `upstream/main` (the remote `upstream`: `git remote add upstream https://github.com/JTM-rootstorm/SwARc.git`), re-lift and compare `build/generated`.
 After lifter changes, re-lift and diff `build/generated` before and after: lifter output should not change unintentionally. SwARc's own rules are in its `CLAUDE.md` and `ARCHITECTURE.md`; nothing game-specific goes into SwARc.
 
 ## Regenerating the manifests
@@ -83,13 +85,23 @@ python3 -I scripts/dev/gen_manifest.py --exe build/input/GH3.exe \
   --noentry manifests/noentry.manifest --out manifests/lifter.manifest
 ```
 
-`manifests/noentry.manifest` lists the lifter's weak function entries that land inside a Ghidra basic block: data that only looks like code pointers. To redo it, export the blocks, lift, then run the finder:
+## Redoing the Ghidra analysis
+The lifter starts from each module's function and jump table lists, made by Ghidra's headless analysis with SwARc's `ExportFunctions.java`/`ExportJumpTables.java`. They are committed in `manifests/ghidra/<module>/` (addresses and names only), so the build needs no Ghidra and lifts the same code on every machine. `manifests/noentry.manifest` was made against them.
+
+To redo them (`brew install ghidra`; a few minutes for `GH3.exe`):
+```sh
+scripts/dev/ghidra_analyze.sh            # all four modules, or name some: GH3.exe fmodex.dll
+git diff --stat manifests/ghidra
+```
+The committed lists come from Ghidra 12.2. Another version can find other functions; if they change, re-lift, redo `manifests/noentry.manifest` (below) and play before committing them. The script also leaves the Ghidra projects in `build/ghidra`, which `scripts/dev/ghidra/*.java` use.
+
+`manifests/noentry.manifest` lists the lifter's weak function entries that land inside a Ghidra basic block: data that only looks like code pointers. To redo it, export the blocks from the Ghidra project (`scripts/dev/ghidra_analyze.sh GH3.exe` makes it), lift, then run the finder:
 ```sh
 JAVA_HOME=$(brew --prefix)/opt/openjdk@25 $(brew --prefix)/opt/ghidra/libexec/support/analyzeHeadless \
   build/ghidra gh3 -process GH3.exe -noanalysis -readOnly -scriptPath scripts/dev/ghidra \
   -postScript ExportBlockStarts.java "$PWD/build/symbols/gh3/blocks.tsv"
 python3 -I scripts/dev/find_false_entries.py --generated build/generated \
-  --functions build/symbols/gh3/functions.tsv --blocks build/symbols/gh3/blocks.tsv \
+  --functions manifests/ghidra/gh3/functions.tsv --blocks build/symbols/gh3/blocks.tsv \
   --out manifests/noentry.manifest
 ```
 

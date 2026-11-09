@@ -6,7 +6,7 @@ The app is built on your Mac from your own copy of the game. There is no downloa
 - A Mac with **Apple Silicon** (M1 or later). It was developed on macOS 26; the app is marked for macOS 13 and later, but older versions are untested.
 - **Your own Guitar Hero III: Legends of Rock installation for PC** (version 1.3.1): the folder with `GH3.exe`, `DATA/`, `AWL.dll` and `fmodex.dll`. We recommend starting from a [BetterGH3](https://github.com/lunalawl/BetterGH3) installation, which is the one this port was developed and tested with. The build is made for one specific `GH3.exe` (SHA-256 `4322a71d…5e804`, see [docs/README.md](../README.md)), and setup stops if yours differs.
 - The **Xcode Command Line Tools**: `xcode-select --install`.
-- **Homebrew** ([brew.sh](https://brew.sh)). Setup installs the packages it needs: cmake, ninja, sdl3, ffmpeg, llvm@22, glslang, spirv-cross, ghidra (with openjdk@25), sevenzip, upx and libusb.
+- **Homebrew** ([brew.sh](https://brew.sh)). Setup installs the packages it needs: cmake, ninja, sdl3, ffmpeg, llvm@22, glslang, spirv-cross, sevenzip, upx and libusb.
 - Disk space: about 2.6 GB (`build/` 1.7 GB, `third_party/SwARc` 0.9 GB). The game folder itself is linked, not copied.
 - An internet connection during setup. It clones SwARc from GitHub and downloads Microsoft's Visual C++ 2005 SP1 redistributable, whose runtime DLLs the game was built against.
 
@@ -20,14 +20,15 @@ You can also put the game folder next to `setup.sh`, named `Guitar Hero III`, an
 
 Setup runs these steps (details in [building.md](../dev/building.md)):
 1. Checks the tools and installs missing Homebrew packages.
-2. Checks out [SwARc](https://github.com/JTM-rootstorm/SwARc) at the tested commit in `third_party/SwARc`, applies this project's patch and builds the lifter.
+2. Checks out [SwARc](https://github.com/JTM-rootstorm/SwARc) (this project's [fork](https://github.com/segovia-no/SwARc/tree/gh3)) at the tested commit in `third_party/SwARc` and builds the lifter.
 3. Copies `GH3.exe` and checks its hash. Unpacks `fmodex.dll`. Downloads and extracts the CRT DLLs. Makes `build/gamedir`.
-4. Analyses the executable and the DLLs with Ghidra (a few minutes).
+4. Reads the executable's and the DLLs' imports and exports; the function lists come with the repository (`manifests/ghidra`).
 5. Lifts them to C++ in `build/generated`.
 6. Compiles the game. This is the long step: about 150 large generated files.
 
-The whole first run took about 21 minutes on an M3 Pro (11 cores), Homebrew packages already installed.
 7. Packages `build/Guitar Hero III.app`.
+
+The whole first run takes about 18 minutes on an M3 Pro (11 cores), Homebrew packages already installed.
 
 When it finishes:
 ```sh
@@ -48,7 +49,7 @@ The app is ad hoc signed and built on your Mac, so Gatekeeper doesn't ask about 
 git pull
 ./setup.sh --game "/path/to/Guitar Hero III"
 ```
-Setup reuses what is still valid: the SwARc checkout, the downloads and the Ghidra analysis. It re-lifts and rebuilds what changed. If a pull changes `patches/swarc-gh3.patch`, delete `third_party/SwARc` first so it is checked out again.
+Setup reuses what is still valid: the SwARc checkout (moved to a newer tested commit when a pull changes it) and the downloads. It re-lifts and rebuilds what changed.
 
 ## Uninstalling
 Delete the app. Then, if you want to remove everything it made:

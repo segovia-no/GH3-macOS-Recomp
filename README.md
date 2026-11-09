@@ -50,16 +50,16 @@ Not yet: GH3+ plugins (the plugin loader is disabled), online play (untested). S
 Found a bug or have an idea? [Open an issue](../../issues/new/choose). Pull requests are welcome; see **[CONTRIBUTING.md](CONTRIBUTING.md)** for how changes are tested and the few rules (above all: no game files in the repository).
 
 ## Credits
-- [SwARc](https://github.com/JTM-rootstorm/SwARc) (MIT): the static recompiler and Win32 runtime this port is built on. Our changes to it are in [`patches/swarc-gh3.patch`](patches/swarc-gh3.patch).
+- [SwARc](https://github.com/JTM-rootstorm/SwARc) (MIT): the static recompiler and Win32 runtime this port is built on. Our changes to it are on the `gh3` branch of [our fork](https://github.com/segovia-no/SwARc/tree/gh3).
 - [GH3+](https://github.com/ExileLord/GH3-Plus) and the PC modding community: what is known about GH3's PC executable.
 - The GH3 research community: the decompilation, script and format projects listed in [docs/notes/01-research.md](docs/notes/01-research.md).
-- [Ghidra](https://ghidra-sre.org), which does the analysis the lifter starts from.
+- [Ghidra](https://ghidra-sre.org), which found the functions the lifter starts from (`manifests/ghidra`).
 
 ## Distribution and legal
-This repository contains only original code, build scripts and documentation. It has no game code, no game assets and nothing translated from `GH3.exe`.
+This repository contains only original code, build scripts and documentation. It has no game code, no game assets and nothing translated from `GH3.exe`. The tables in `manifests/` hold only addresses and names of functions (where they are, not what they do).
 
 `setup.sh` makes the following on your computer, from your copy of the game:
-- `build/` (the lifted C++, Ghidra projects, symbol exports, the `gh3` binary);
+- `build/` (the lifted C++, symbol exports, the `gh3` binary);
 - `build/Guitar Hero III.app`;
 - `~/Library/Application Support/gh3/game`.
 

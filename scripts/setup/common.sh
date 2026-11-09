@@ -7,11 +7,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD="${GH3_BUILD_DIR:-$ROOT/build}"
 GAME="${GH3_GAME_DIR:-$ROOT/Guitar Hero III}"
 SWARC="${SWARC_DIR:-$ROOT/third_party/SwARc}"
-SWARC_URL="https://github.com/JTM-rootstorm/SwARc.git"
-SWARC_COMMIT="240ef135e05b0bb120aaa3fc4fa5923b1e73ead5"
+# SwARc: this project's fork of JTM-rootstorm/SwARc. Its gh3 branch is
+# upstream plus the generic changes this port needs (docs/dev/architecture.md).
+SWARC_URL="https://github.com/segovia-no/SwARc.git"
+SWARC_BRANCH="gh3"
+SWARC_COMMIT="4a7ec399886952f90a643a75c8ecde42deeba6ca"
 
 INPUT="$BUILD/input"      # GH3.exe and the DLLs that are lifted with it
-SYMBOLS="$BUILD/symbols"  # per module: pe_symbols.py and Ghidra exports
+SYMBOLS="$BUILD/symbols"  # per module: pe_symbols.py output, manifests/ghidra tables
 LOGS="$BUILD/logs"
 GAMEDIR="$BUILD/gamedir"  # the game folder the build runs (links + runtime files)
 CMAKE_BUILD="$BUILD/cmake"
@@ -29,6 +32,7 @@ MSVCP80_SHA256="372af797353f9335915cd06d4076bab8410775dcaf2dac0593197d7c41bbffb2
 
 BREW="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
 LLVM_ROOT="$BREW/opt/llvm@22"
+# Ghidra: only for scripts/dev (the build uses manifests/ghidra).
 GHIDRA_JAVA="$BREW/opt/openjdk@25"
 GHIDRA_HEADLESS="$BREW/opt/ghidra/libexec/support/analyzeHeadless"
 LIFTER="$SWARC/out/build/release/tools/lifter_x86/recomp_lift"
