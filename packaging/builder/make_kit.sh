@@ -51,7 +51,7 @@ ninja -C "$cm" -t commands gh3 | CMAKE_BUILD="$cm" python3 -I "$here/kit_flags.p
 # The files the build checks (scripts/setup/common.sh), and the version.
 {
   grep -E '^(GH3_EXE|FMODEX_PACKED|FMODEX|MSVCR80|MSVCP80|VCREDIST)_(SHA256|URL)=' "$ROOT/scripts/setup/common.sh"
-  echo "VERSION=\"$(git -C "$ROOT" rev-parse --short HEAD)\""
+  echo "VERSION=\"$(git -C "$ROOT" describe --tags --always | sed 's/^v//')\""
   echo "BUILD_NUMBER=\"$(git -C "$ROOT" rev-list --count HEAD)\""
 } > "$kit/config.sh"
 

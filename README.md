@@ -45,6 +45,7 @@ Not yet: GH3+ plugins (the plugin loader is disabled), online play (untested). S
 | [Building from source](docs/dev/building.md) | the pipeline step by step, developer tools |
 | [Architecture](docs/dev/architecture.md) | how the recompilation works, repository layout |
 | [Technical notes](docs/README.md) | research, decompilation cross-reference, porting log |
+| [Changelog](CHANGELOG.md) | what changed in each release |
 
 ## Contributing
 Found a bug or have an idea? [Open an issue](../../issues/new/choose). Pull requests are welcome; see **[CONTRIBUTING.md](CONTRIBUTING.md)** for how changes are tested and the few rules (above all: no game files in the repository).

@@ -90,7 +90,7 @@ cat > "$contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>Guitar Hero III</string>
   <key>CFBundleIconFile</key><string>gh3</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>$(git -C "$root" rev-parse --short HEAD)</string>
+  <key>CFBundleShortVersionString</key><string>$(git -C "$root" describe --tags --always | sed 's/^v//')</string>
   <key>CFBundleVersion</key><string>$(git -C "$root" rev-list --count HEAD)</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.music-games</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
