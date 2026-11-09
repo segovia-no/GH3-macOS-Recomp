@@ -54,6 +54,13 @@ int main(int argc, char** argv) {
   game.exe_name = "GH3.exe";
   game.fullscreen = recomp::win32::GameConfig::Fullscreen::Window;
   game.video_memory_mb = 256;
+  // GH3 takes DirectInput's mouse exclusively, but uses it only for strum
+  // buttons and menus: in a window the pointer stays free for the desktop.
+  game.grab_pointer_in_window = false;
+  // GH3 ignores WM_CLOSE (it quits only from its own menu), so Quit from the
+  // Dock, Cmd+Q and the window's close button end the process directly. Its
+  // settings (AspyrConfig.ini, src/awl.cpp) are written as they change.
+  game.quit_on_close_request = true;
   // The VC++ 2005 SP1 CRT (8.0.50727.6195, from Microsoft's redistributable),
   // lifted with the EXE; msvcp80 imports msvcr80, so msvcr80 comes first.
   // FMOD Ex (UPX-unpacked fmodex.dll) imports msvcr80, so it follows it.

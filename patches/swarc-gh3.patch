@@ -1183,6 +1183,27 @@ index 62cb420..9dcfcd0 100644
  // ---- ID3DXBuffer ------------------------------------------------------------------------
  
  struct XBuffer : com::Object {
+diff --git a/platforms/win32/src/win32/dinput8.cpp b/platforms/win32/src/win32/dinput8.cpp
+index c732693..71b842c 100644
+--- a/platforms/win32/src/win32/dinput8.cpp
++++ b/platforms/win32/src/win32/dinput8.cpp
+@@ -156,11 +156,14 @@ void OnRawInput(const RawInput& in) {
+ }
+ 
+ // The exclusive mouse hides the pointer and reports motion without
+-// bounds, as on Windows: SDL's relative mode on the device's window.
++// bounds, as on Windows: SDL's relative mode on the device's window
++// (unless the game keeps the pointer free in a window, PointerGrabAllowed;
++// motion and buttons arrive either way).
+ void Grab(InputDevice& d, bool on) {
+   if (d.grabbed == on || d.keyboard || !(d.coop & DISCL_EXCLUSIVE) || Background())
+     return;
+-  if (SDL_Window* w = SdlWindowFor(d.hwnd)) SDL_SetWindowRelativeMouseMode(w, on);
++  SDL_Window* w = SdlWindowFor(d.hwnd);
++  if (w && (!on || PointerGrabAllowed(w))) SDL_SetWindowRelativeMouseMode(w, on);
+   d.grabbed = on;
+ }
+ 
 diff --git a/platforms/win32/src/win32/dsound.cpp b/platforms/win32/src/win32/dsound.cpp
 index 7c8dc7c..adbf986 100644
 --- a/platforms/win32/src/win32/dsound.cpp
@@ -1623,10 +1644,31 @@ index eb0bd8d..b5c4850 100644
  
  }  // namespace recomp
 diff --git a/platforms/win32/src/win32/process.h b/platforms/win32/src/win32/process.h
-index f3aaec5..64080de 100644
+index f3aaec5..0e0b399 100644
 --- a/platforms/win32/src/win32/process.h
 +++ b/platforms/win32/src/win32/process.h
-@@ -62,6 +62,12 @@ struct GameConfig : recomp::GameConfig {
+@@ -52,6 +52,20 @@ struct GameConfig : recomp::GameConfig {
+   };
+   Fullscreen fullscreen = Fullscreen::Desktop;
+ 
++  // An exclusive DirectInput mouse or a ClipCursor rectangle confines the
++  // pointer, as on Windows: the host pointer is grabbed (hidden, relative
++  // motion). false: only while the window is fullscreen; in a window the
++  // pointer stays free, for games that use the mouse only for buttons and
++  // menus, where a captured pointer just gets in the way of the desktop.
++  bool grab_pointer_in_window = true;
++
++  // A quit request from the host (the app's Quit menu item and Cmd+Q on
++  // macOS, the Dock, the window's close button) is posted to the game's
++  // windows as WM_CLOSE. true: it ends the process at once instead (as
++  // ExitProcess(0)), for games that ignore WM_CLOSE and only quit from
++  // their own menus.
++  bool quit_on_close_request = false;
++
+   // Video memory DirectDraw reports, in MB. Games pick detail settings
+   // from it; a game's best profile may need more than the default.
+   uint32_t video_memory_mb = 64;
+@@ -62,6 +76,12 @@ struct GameConfig : recomp::GameConfig {
    struct LiftedDll {
      std::string name;   // file name, e.g. "game.dll"
      uint32_t base = 0;  // the lifter's --base for it; 0 = preferred base
@@ -1639,7 +1681,7 @@ index f3aaec5..64080de 100644
    };
    std::vector<LiftedDll> lifted_dlls;
  };
-@@ -94,6 +100,7 @@ struct Module {
+@@ -94,6 +114,7 @@ struct Module {
    int refs = 0;        // LoadLibrary count (under kernel32's loader lock)
    bool stale = false;  // has run since it was mapped: map afresh on load
    int tls_index = -1;  // its static TLS slot (x64 guests), -1: none
@@ -1724,10 +1766,55 @@ index 147a768..abd7c1d 100644
  // bit 0 = "pressed since last call" (still honoured by Windows XP).
  HLE("user32.dll", GetKeyState, 1) {
 diff --git a/platforms/win32/src/win32/user32_window.cpp b/platforms/win32/src/win32/user32_window.cpp
-index ce8f08b..bba5bd3 100644
+index ce8f08b..4e839c8 100644
 --- a/platforms/win32/src/win32/user32_window.cpp
 +++ b/platforms/win32/src/win32/user32_window.cpp
-@@ -1593,6 +1593,22 @@ HLE("user32.dll", SetWindowTextA, 2) {
+@@ -407,7 +407,16 @@ void AttachClip() {
+     g_clip.hwnd = ClipWindow();
+     if (Window* w = Win(g_clip.hwnd)) grab = w->sdl;
+   }
+-  if (grab && !Background()) SDL_SetWindowRelativeMouseMode(grab, true);
++  if (grab && PointerGrabAllowed(grab)) SDL_SetWindowRelativeMouseMode(grab, true);
++}
++
++// GameConfig::quit_on_close_request: the host asked to quit, so end the
++// process the way ExitProcess(0) does.
++[[noreturn]] void QuitNow(const char* why) {
++  std::fflush(stdout);
++  std::fprintf(stderr, "quit requested (%s): exiting\n", why);
++  std::fflush(stderr);
++  std::_Exit(0);
+ }
+ 
+ void ActivateApp(uint32_t hwnd, bool active) {
+@@ -430,12 +439,14 @@ void ActivateApp(uint32_t hwnd, bool active) {
+ void HandleSdlEvent(const SDL_Event& e) {
+   switch (e.type) {
+     case SDL_EVENT_QUIT: {
++      if (Game().quit_on_close_request) QuitNow("host quit");
+       std::lock_guard<std::recursive_mutex> l(g_mu);
+       for (auto& [h, w] : g_windows)
+         if (w.sdl && !w.destroyed) Post(h, WM_CLOSE, 0, 0);
+       break;
+     }
+     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
++      if (Game().quit_on_close_request) QuitNow("window closed");
+       if (uint32_t h = HwndForSdl(e.window.windowID)) Post(h, WM_CLOSE, 0, 0);
+       break;
+     case SDL_EVENT_WINDOW_FOCUS_GAINED:
+@@ -1070,6 +1081,11 @@ SDL_Window* SdlWindowFor(uint32_t hwnd) {
+   return w ? w->sdl : nullptr;
+ }
+ 
++bool PointerGrabAllowed(SDL_Window* w) {
++  if (!w || Background()) return false;
++  return Game().grab_pointer_in_window || (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN);
++}
++
+ void SetExclusiveMode(uint32_t hwnd, int w, int h) {
+   SDL_Window* sdl;
+   {
+@@ -1593,6 +1609,22 @@ HLE("user32.dll", SetWindowTextA, 2) {
    return 1;
  }
  
@@ -1750,6 +1837,31 @@ index ce8f08b..bba5bd3 100644
  HLE("user32.dll", GetWindowTextA, 3) {
    std::lock_guard<std::recursive_mutex> l(g_mu);
    Window* w = Win(Arg(c, 0));
+@@ -2193,7 +2225,7 @@ HLE("user32.dll", ClipCursor, 1) {
+     }
+   }
+   if (release && release != grab) SDL_SetWindowRelativeMouseMode(release, false);
+-  if (grab && !Background()) SDL_SetWindowRelativeMouseMode(grab, true);
++  if (grab && PointerGrabAllowed(grab)) SDL_SetWindowRelativeMouseMode(grab, true);
+   return 1;
+ }
+ 
+diff --git a/platforms/win32/src/win32/user32_window.h b/platforms/win32/src/win32/user32_window.h
+index d12f8d2..9916894 100644
+--- a/platforms/win32/src/win32/user32_window.h
++++ b/platforms/win32/src/win32/user32_window.h
+@@ -18,6 +18,11 @@ SDL_Window* SdlWindowFor(uint32_t hwnd);
+ uint32_t DcForWindow(uint32_t hwnd);
+ uint32_t WindowForDc(uint32_t hdc);
+ 
++// Whether the host pointer may be grabbed (relative mode) for w now: not
++// in automated runs, and with GameConfig::grab_pointer_in_window false
++// only while w is fullscreen.
++bool PointerGrabAllowed(SDL_Window* w);
++
+ // Whether the caller is the guest's main thread (the one SDL's video and
+ // events belong to).
+ bool OnMainThread();
 diff --git a/platforms/win32/src/win32/ws2_32.cpp b/platforms/win32/src/win32/ws2_32.cpp
 index 3e3ae1f..96b403f 100644
 --- a/platforms/win32/src/win32/ws2_32.cpp

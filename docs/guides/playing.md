@@ -42,6 +42,10 @@ Up to four controllers can connect. Rumble is sent to gamepads (not tested yet).
 ### Other gamepads
 Controllers that SDL supports (Xbox One/Series, DualShock 4, DualSense, ...) appear to the game as XInput gamepads. This path has not been tested with GH3 yet.
 
+## Window and quitting
+- In a window, the mouse pointer stays free: you can use the desktop and click the strum buttons in the window. In fullscreen (`GH3_FULLSCREEN=desktop` or `exclusive`), the game captures the pointer as it does on Windows.
+- **Quit** from the Dock, **⌘Q** or the window's close button ends the game right away. Settings are saved as you change them; quit from the game's own menu if you are in the middle of something you want saved.
+
 ## Audio calibration
 At 0 ms the music is in sync with the notes on a Mac's built-in output. Leave both offsets at 0 unless you hear a difference (Bluetooth headphones add their own delay).
 
