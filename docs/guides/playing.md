@@ -47,7 +47,7 @@ Controllers that SDL supports (Xbox One/Series, DualShock 4, DualSense, ...) app
 - **Quit** from the Dock, **⌘Q** or the window's close button ends the game right away. Settings are saved as you change them; quit from the game's own menu if you are in the middle of something you want saved.
 
 ## Audio calibration
-At 0 ms the music is in sync with the notes on a Mac's built-in output. Leave both offsets at 0 unless you hear a difference (Bluetooth headphones add their own delay).
+Calibrate once before playing: the right offset depends on your Mac and its audio output (Bluetooth headphones add their own delay).
 
 With a BetterGH3 installation (the recommended starting point), the calibration menu has **Audio** and **Video** offsets instead of the game's original audio lag setting (options menu → calibrate lag):
 - **Audio** moves the notes and the hit timing together, relative to the music. Use it when the music sounds early or late compared with the notes and your hits.

@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![Status](https://img.shields.io/badge/status-playable-brightgreen)
 
-Play **Guitar Hero III: Legends of Rock** for PC natively on Apple Silicon Macs. It renders on Metal at 120 fps, the music stays in sync with the notes, and Xbox 360 wireless guitars work without installing a driver.
+Play **Guitar Hero III: Legends of Rock** for PC natively on Apple Silicon Macs. It renders on Metal at 120 fps, and Xbox 360 wireless guitars work without installing a driver.
 
 This is a *static recompilation*. The game's Windows executable from your own copy is translated ahead of time to C++ and compiled into a native arm64 program on your Mac. It runs on [SwARc](https://github.com/JTM-rootstorm/SwARc), a runtime that reimplements the Windows, Direct3D 9, DirectSound, DirectInput/XInput and Bink parts the game uses. There is no emulator, no Wine and no interpreter.
 
@@ -27,7 +27,6 @@ open "build/Guitar Hero III.app"
 ## What works
 - Intro movies, menus, and playing songs. Tested in quickplay with the keyboard and with a wireless guitar; other modes have not been checked one by one.
 - **Metal** rendering. 120 fps on a 120 Hz display (vsync-capped). A window sized for Retina displays by default, or fullscreen.
-- **Audio** through CoreAudio, in sync with the notes at 0 ms calibration.
 - **Controllers**:
   - keyboard and mouse;
   - SDL gamepads (untested);

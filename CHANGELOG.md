@@ -8,7 +8,7 @@ First playable release. Source only: the game is built on your Mac from your own
 ### Works
 - Intro movies, menus and songs. Tested in quickplay with the keyboard and with an Xbox 360 wireless guitar.
 - Metal rendering at 120 fps on a 120 Hz display (vsync-capped), in a window or fullscreen.
-- Audio through CoreAudio, in sync with the notes at 0 ms calibration. BetterGH3's audio and video calibration offsets work.
+- Audio through CoreAudio. BetterGH3's audio and video calibration offsets work: calibrate once for your output (see [playing.md](docs/guides/playing.md#audio-calibration)).
 - Keyboard and mouse. In a window the pointer stays free.
 - Xbox 360 wireless guitars through the Windows receiver (clones too), read over USB with no driver: frets, strum bar and whammy.
 - A double-clickable app bundle. Quit from the Dock, ⌘Q or the close button.

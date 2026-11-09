@@ -34,7 +34,7 @@ The addresses in `manifests/` and `src/` belong to this executable, and `scripts
 **Playable on macOS (Apple Silicon)** as of 2026-11-09:
 - intro movies, menus, songs;
 - 120 fps (vsync-capped) in gameplay;
-- audio in sync at 0 ms calibration;
+- audio through CoreAudio, with working calibration offsets;
 - keyboard, mouse, SDL gamepads (untested), and Xbox 360 wireless guitars through the receiver (read over libusb, no driver);
 - a double-clickable app bundle.
 
