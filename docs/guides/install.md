@@ -14,7 +14,7 @@ The app is built on your Mac from your own copy of the game. There is no downloa
 Each [release](https://github.com/segovia-no/GH3-macOS-Recomp/releases) has **GH3 Builder**, an app that builds the game on your Mac without Homebrew or the terminal. You need macOS 26 or later and Apple's Xcode Command Line Tools; the builder offers to install the tools if they are missing.
 1. Download `GH3-Builder-<version>-macOS26-arm64.zip` and unzip it.
 2. Open **GH3 Builder**. The first time, macOS stops it because it is not notarized: open System Settings → Privacy & Security, click **Open Anyway** next to "GH3 Builder", and confirm.
-3. Choose your Guitar Hero III folder and where to put the app (default: `~/Applications`), then click **Build**. The first build takes about 15 minutes.
+3. Choose your Guitar Hero III folder and where to put the app (default: your Applications folder), then click **Build**. The first build takes about 15 minutes.
 4. Click **Play**.
 
 The builder holds nothing from the game. Its Licenses button lists the open-source components inside it. It keeps its work files in `~/Library/Caches/GH3-macOS-Recomp`, so building again after an update is quick.

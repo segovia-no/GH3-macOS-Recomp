@@ -31,8 +31,11 @@ final class BuildModel: ObservableObject {
 
   @Published var toolsInstalled = BuildModel.commandLineToolsInstalled()
   @Published var gameDir: URL?
-  @Published var outDir = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent("Applications")
+  // /Applications, where people look for apps; ~/Applications for an
+  // account that can't write there (a standard user).
+  @Published var outDir = FileManager.default.isWritableFile(atPath: "/Applications")
+    ? URL(fileURLWithPath: "/Applications")
+    : FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications")
   @Published var embed = false
   @Published var state = State.idle
   @Published var step = 0

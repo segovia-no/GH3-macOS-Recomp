@@ -37,7 +37,7 @@ It prints `@@step n/6 title`, `@@progress done/total` and `@@done <app>` for the
 
 `packaging/builder/make_builder.sh` makes `build/builder/GH3 Builder.app` (58 MB). It's a SwiftUI front end (`app/GH3Builder.swift`, one file, compiled with the Command Line Tools' `swiftc`, macOS 13+) with the kit in `Contents/Resources/kit`. In it, the player:
 - installs the Command Line Tools if missing (`xcode-select --install`; the app checks again every 5 s);
-- picks the game folder and where the app goes (default `~/Applications`);
+- picks the game folder and where the app goes (default `/Applications`, or `~/Applications` if the account can't write there);
 - clicks Build.
 
 It shows the step, a progress bar for the compile and the log. It keeps the Mac awake while building, Cancel stops the whole process tree, and when it's done it offers "Play".
